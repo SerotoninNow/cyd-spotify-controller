@@ -60,6 +60,28 @@ The heart uses the Spotify Web API, so it needs a one-time setup:
 
 Tap the heart to add the current song to Liked Songs; it fills green. Tap again to remove it.
 
+## 4. Start it when you log in (optional)
+
+On desktops using systemd (most Linux distros, Raspberry Pi OS), install the user service
+from this folder:
+
+```bash
+mkdir -p ~/.config/systemd/user
+```
+
+```bash
+sed "s|%h/cyd-spotify|$PWD|" cyd-spotify.service > ~/.config/systemd/user/cyd-spotify.service
+```
+
+```bash
+systemctl --user daemon-reload && systemctl --user enable --now cyd-spotify
+```
+
+It starts with your desktop session, restarts if it crashes, and keeps retrying while the CYD is
+unplugged. Check on it with `systemctl --user status cyd-spotify`, read its log with
+`journalctl --user -u cyd-spotify -f`, and turn it off with `systemctl --user disable --now cyd-spotify`.
+If you move this folder, run the `sed` command again.
+
 ## Troubleshooting
 
 - **Touches land off-target**: adjust the `TOUCH_*_MIN/MAX` values in `firmware/src/main.cpp`.
