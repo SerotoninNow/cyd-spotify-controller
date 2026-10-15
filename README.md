@@ -82,6 +82,41 @@ unplugged. Check on it with `systemctl --user status cyd-spotify`, read its log 
 `journalctl --user -u cyd-spotify -f`, and turn it off with `systemctl --user disable --now cyd-spotify`.
 If you move this folder, run the `sed` command again.
 
+## Standalone: no computer needed (experimental)
+
+With different firmware, the CYD talks to Spotify over Wi-Fi by itself, so USB only powers it:
+a phone charger, a Windows PC, anything. It shows and controls whatever your Spotify account is
+playing, on any device (phone, PC, speaker). Differences from the version above:
+
+- Playback controls need **Spotify Premium** (a Spotify rule for apps).
+- Updates arrive every couple of seconds rather than every second.
+- Song titles in non-Latin scripts show as `?`, and accents are dropped (the fonts are ASCII only).
+
+**S1. Flash it** (stop the PC version first: `systemctl --user stop cyd-spotify`):
+
+```bash
+.venv/bin/pio run -d firmware -e standalone -t upload
+```
+
+Use `-e standalone2usb` for the two-port board. The screen then says it isn't set up yet.
+
+**S2. Set it up** with the board still plugged into this computer. In your Spotify app on the
+developer dashboard, the redirect URI `http://127.0.0.1:8898/callback` must be listed (step 3).
+
+```bash
+python3 cyd_spotify.py --setup-standalone
+```
+
+It asks for your Wi-Fi name and password (2.4 GHz networks only; the ESP32 has no 5 GHz radio),
+opens Spotify in the browser to approve access, then sends both to the CYD, which keeps them in
+its own flash and restarts. Nothing is saved on the computer. If you never ran `--spotify-login`,
+add your Client ID after `--setup-standalone`.
+
+Run the setup again to change Wi-Fi network. Anyone who has the board and a USB cable can read
+the stored Wi-Fi password and Spotify sign-in back out of it, so treat it like a signed-in phone.
+
+**Going back** to the computer version: flash `-e cyd` (or `-e cyd2usb`) again.
+
 ## Troubleshooting
 
 - **Touches land off-target**: adjust the `TOUCH_*_MIN/MAX` values in `firmware/src/main.cpp`.
@@ -89,3 +124,5 @@ If you move this folder, run the `sed` command again.
 - **Frames get lost**: set `LINK_BAUD` in `firmware/platformio.ini` to `921600`, reflash, and
   pass `--baud 921600`.
 - **Seeing touches**: run with `CYD_DEBUG=1` to print each touch and the button it hit.
+- **Standalone version misbehaving**: `.venv/bin/pio device monitor -d firmware -e standalone` shows
+  its log (Wi-Fi, Spotify errors). Close it before running the setup.

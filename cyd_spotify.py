@@ -52,12 +52,12 @@ def _http_json(url, data=None, method=None, headers=None):
     return json.loads(body) if body else None
 
 
-def spotify_login(client_id):
-    """One-time sign-in (OAuth with PKCE, so no client secret is needed). Saves a refresh token."""
+def spotify_authorize(client_id, scope, purpose):
+    """Spotify sign-in in the browser (OAuth with PKCE, so no client secret is needed).
+    Returns a refresh token."""
     import base64
     import hashlib
     import http.server
-    import json
     import secrets
     import urllib.parse
     import webbrowser
@@ -67,7 +67,7 @@ def spotify_login(client_id):
     state = secrets.token_urlsafe(16)
     url = "https://accounts.spotify.com/authorize?" + urllib.parse.urlencode(dict(
         client_id=client_id, response_type="code", redirect_uri=SPOTIFY_REDIRECT, state=state,
-        scope="user-library-read user-library-modify", code_challenge_method="S256", code_challenge=challenge))
+        scope=scope, code_challenge_method="S256", code_challenge=challenge))
     result = {}
 
     class Handler(http.server.BaseHTTPRequestHandler):
@@ -86,7 +86,7 @@ def spotify_login(client_id):
 
     host, port = urllib.parse.urlparse(SPOTIFY_REDIRECT).netloc.split(":")
     with http.server.HTTPServer((host, int(port)), Handler) as server:
-        print(f"Open this link to let the CYD like songs on your Spotify account:\n\n  {url}\n")
+        print(f"Open this link to let the CYD {purpose}:\n\n  {url}\n")
         webbrowser.open(url)
         while not result:
             server.handle_request()
@@ -95,11 +95,76 @@ def spotify_login(client_id):
     tok = _http_json("https://accounts.spotify.com/api/token", urllib.parse.urlencode(dict(
         grant_type="authorization_code", code=result["code"], redirect_uri=SPOTIFY_REDIRECT,
         client_id=client_id, code_verifier=verifier)).encode())
+    return tok["refresh_token"]
+
+
+def spotify_login(client_id):
+    """One-time sign-in for liking songs from this computer. Saves the refresh token."""
+    import json
+
+    token = spotify_authorize(client_id, "user-library-read user-library-modify",
+                              "like songs on your Spotify account")
     os.makedirs(os.path.dirname(SPOTIFY_CONFIG), exist_ok=True)
     fd = os.open(SPOTIFY_CONFIG, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f:
-        json.dump(dict(client_id=client_id, refresh_token=tok["refresh_token"]), f)
+        json.dump(dict(client_id=client_id, refresh_token=token), f)
     print(f"Signed in. Saved to {SPOTIFY_CONFIG}")
+
+
+def setup_standalone(port_name, client_id):
+    """Sends Wi-Fi details and a Spotify sign-in to a CYD running the standalone firmware,
+    which keeps them in its own flash. Nothing is saved on this computer."""
+    import getpass
+    import json
+
+    if not client_id:
+        try:
+            with open(SPOTIFY_CONFIG) as f:
+                client_id = json.load(f)["client_id"]
+        except (OSError, ValueError, KeyError):
+            raise SystemExit("Give your Spotify app's Client ID: --setup-standalone CLIENT_ID (see README)")
+
+    try:
+        port = serial.Serial(port_name, 115200, timeout=0.5)
+    except serial.SerialException as err:
+        raise SystemExit(f"{port_name}: {err}\nIf the PC version is running, stop it first "
+                         "(systemctl --user stop cyd-spotify).")
+    with port:
+        # Restart the board (EN low through RTS, with IO0 left high so it boots normally).
+        port.dtr, port.rts = False, True
+        time.sleep(0.1)
+        port.rts = False
+
+        def command(line, timeout=5):
+            port.write((line + "\n").encode())
+            end = time.monotonic() + timeout
+            while time.monotonic() < end:
+                reply = port.readline().decode(errors="replace").strip()
+                if reply == "OK":
+                    return
+                if reply.startswith("ERR"):
+                    raise SystemExit(f"The CYD refused '{line.split('=')[0]}': {reply}")
+            raise SystemExit("The CYD didn't answer. Is the standalone firmware on it? (README, step S1)")
+
+        end = time.monotonic() + 6
+        while time.monotonic() < end and b"CYD-STANDALONE READY" not in port.readline():
+            pass
+        command("INFO")  # also confirms it's listening if the ready line was missed
+        print("Found the CYD.\n")
+
+        ssid = input("Wi-Fi network name (2.4 GHz): ").strip()
+        password = getpass.getpass("Wi-Fi password (not shown): ")
+        if not ssid or "\n" in ssid + password:
+            raise SystemExit("That network name or password can't be used.")
+        token = spotify_authorize(
+            client_id, "user-read-playback-state user-modify-playback-state user-library-read user-library-modify",
+            "show and control your Spotify playback")
+        for key, value in (("wifi_ssid", ssid), ("wifi_pass", password), ("client_id", client_id),
+                           ("refresh_token", token)):
+            command(f"SET {key}={value}")
+        command("REBOOT")
+    print(f"\nDone. The CYD will join {ssid} and show what's playing on your Spotify account.\n"
+          "From now on it only needs USB power: a phone charger or any computer will do.")
 
 
 class SpotifyLikes:
@@ -499,9 +564,15 @@ def main():
     ap.add_argument("--quality", type=int, default=70, help="JPEG quality 1-95")
     ap.add_argument("--spotify-login", metavar="CLIENT_ID",
                     help="sign in to Spotify once so the heart button can like songs, then exit")
+    ap.add_argument("--setup-standalone", metavar="CLIENT_ID", nargs="?", const="",
+                    help="set up a CYD running the standalone firmware (Wi-Fi and Spotify), then exit; "
+                         "the Client ID defaults to the one from --spotify-login")
     args = ap.parse_args()
     if args.spotify_login:
         spotify_login(args.spotify_login)
+        return
+    if args.setup_standalone is not None:
+        setup_standalone(args.port, args.setup_standalone)
         return
 
     screen = MusicCapture(args.player)
