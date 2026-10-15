@@ -1,8 +1,8 @@
 # Spotify now playing on an ESP32-2432S028
 
 The CYD ("Cheap Yellow Display") plugs into a USB port on your PC or Raspberry Pi and shows
-what's playing: album art, title, artist and progress, with touch buttons for previous,
-play/pause, next, and a heart that adds the song to your Liked Songs.
+what's playing: album art, title, artist and progress, with touch buttons for shuffle, previous,
+play/pause, next, repeat (off, queue, song), and a heart that adds the song to your Liked Songs.
 
 It works with Spotify and any other MPRIS player (Firefox, VLC...), preferring Spotify when
 several are open. The heart only appears for Spotify songs, once you've signed in (step 3).

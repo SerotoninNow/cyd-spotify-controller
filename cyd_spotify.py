@@ -4,8 +4,8 @@
     python3 cyd_spotify.py                              # run it (CYD plugged into a USB port)
     python3 cyd_spotify.py --spotify-login CLIENT_ID    # one-time sign-in so the heart can like songs
 
-Shows album art, title, artist and progress, with touch buttons for previous, play/pause, next
-and Liked Songs. Works with any MPRIS player through playerctl, preferring Spotify.
+Shows album art, title, artist and progress, with touch buttons for shuffle, previous, play/pause,
+next, repeat and Liked Songs. Works with any MPRIS player through playerctl, preferring Spotify.
 See ../firmware/src/main.cpp for the link protocol.
 """
 import io
@@ -149,9 +149,10 @@ class MusicCapture:
 
     BG, FG, DIM, TRACK, ACCENT = (12, 14, 20), (235, 238, 245), (140, 146, 160), (40, 44, 56), (30, 215, 96)
     FIELDS = ("status", "playerName", "xesam:title", "xesam:artist", "xesam:album", "mpris:artUrl",
-              "mpris:length", "position", "mpris:trackid", "xesam:url")
+              "mpris:length", "position", "mpris:trackid", "xesam:url", "shuffle", "loop")
     ART = 128
-    BUTTONS = ("prev", "play", "next", "like")
+    BUTTONS = ("shuffle", "prev", "play", "next", "repeat", "like")
+    REPEAT_NEXT = {"None": "Playlist", "Playlist": "Track", "Track": "None"}  # off, queue, song, as in Spotify
     BTN_Y0, BTN_Y1 = 186, 234
 
     def __init__(self, player="spotify"):
@@ -161,6 +162,7 @@ class MusicCapture:
         self.players = f"{player},%any" if player else "%any"
         self.title_font, self.font, self.small = load_font(17, True), load_font(14), load_font(11)
         self.info, self.polled, self.pos_at = None, 0.0, 0.0
+        self.frame, self.frame_key = None, None  # last drawing, and the state it was drawn from
         self.art_cache, self.art_loading = {}, set()
         self.pressed = None
         self.box = (0, 0, W, H)
@@ -260,8 +262,16 @@ class MusicCapture:
             if self.likes and info["uri"]:
                 self._background(self._toggle_like, info["uri"])
             return
-        cmd = {"prev": "previous", "play": "play-pause", "next": "next"}[button]
-        self._background(subprocess.run, ["playerctl", "-p", info["playerName"], cmd], capture_output=True)
+        if button == "shuffle":
+            on = info["shuffle"] != "true"
+            info["shuffle"] = "true" if on else "false"  # show it straight away; the next poll confirms
+            cmd = ["shuffle", "On" if on else "Off"]
+        elif button == "repeat":
+            info["loop"] = self.REPEAT_NEXT.get(info["loop"], "None")
+            cmd = ["loop", info["loop"]]
+        else:
+            cmd = [{"prev": "previous", "play": "play-pause", "next": "next"}[button]]
+        self._background(subprocess.run, ["playerctl", "-p", info["playerName"], *cmd], capture_output=True)
         self.polled = 0  # pick up the change on the next frame
 
     # --- drawing ---
@@ -289,8 +299,28 @@ class MusicCapture:
         s = int(s)
         return f"{s // 3600}:{s % 3600 // 60:02d}:{s % 60:02d}" if s >= 3600 else f"{s // 60}:{s % 60:02d}"
 
-    def _icon(self, d, name, cx, cy, color, playing, liked):
-        if name == "play" and playing:
+    def _icon(self, d, name, cx, cy, color, info, liked):
+        playing = info["status"] == "Playing"
+        if name == "shuffle":
+            on = info["shuffle"] == "true"
+            c = self.ACCENT if on else color
+            for y0, y1 in ((cy - 7, cy + 7), (cy + 7, cy - 7)):
+                d.line((cx - 11, y0, cx + 6, y1), fill=c, width=2)
+                d.polygon(((cx + 12, y1), (cx + 5, y1 - 5), (cx + 5, y1 + 5)), fill=c)
+            if on:
+                d.ellipse((cx - 2, cy + 14, cx + 2, cy + 18), fill=c)
+        elif name == "repeat":
+            mode = info["loop"]
+            c = self.ACCENT if mode in ("Playlist", "Track") else color
+            d.rounded_rectangle((cx - 11, cy - 7, cx + 11, cy + 7), 5, outline=c, width=2)
+            d.rectangle((cx - 8, cy - 9, cx - 5, cy - 5), fill=self.BG)  # gap behind the arrowhead
+            d.polygon(((cx - 2, cy - 6), (cx - 7, cy - 11), (cx - 7, cy - 1)), fill=c)
+            if mode == "Track":
+                d.line((cx + 1, cy - 3, cx + 1, cy + 3), fill=c, width=2)  # a "1"; text is too blurry at this size
+                d.line((cx - 1, cy - 1, cx + 1, cy - 3), fill=c, width=2)
+            if mode in ("Playlist", "Track"):
+                d.ellipse((cx - 2, cy + 14, cx + 2, cy + 18), fill=c)
+        elif name == "play" and playing:
             d.rectangle((cx - 9, cy - 11, cx - 3, cy + 11), fill=color)
             d.rectangle((cx + 3, cy - 11, cx + 9, cy + 11), fill=color)
         elif name == "play":
@@ -324,9 +354,20 @@ class MusicCapture:
                     not prev or prev["uri"] != self.info["uri"]):
                 self._background(self._load_liked, self.info["uri"])
 
-        img = Image.new("RGB", (W, H), self.BG)
-        d = ImageDraw.Draw(img)
+        # Redraw only when something visible changed: the panel mostly sits still, and drawing
+        # plus comparing frames 30 times a second costs far more than this check.
         info = self.info
+        key = None
+        if info:
+            pos = self._position()
+            bar = int((W - 24) * min(max(pos / info["length"], 0.0), 1.0)) if info["length"] else 0
+            key = (tuple(info[f] for f in self.FIELDS if f != "position"), int(pos), bar, self.pressed,
+                   self.liked.get(info["uri"]), self.art_cache.get(info["mpris:artUrl"]) is not None)
+        if self.frame is not None and key == self.frame_key:
+            return self.frame
+        self.frame_key = key
+        self.frame = img = Image.new("RGB", (W, H), self.BG)
+        d = ImageDraw.Draw(img)
         if not info:
             d.text((W // 2, H // 2), "Nothing playing", font=self.title_font, fill=self.DIM, anchor="mm")
             return img
@@ -368,13 +409,14 @@ class MusicCapture:
         bw = W // len(self.BUTTONS)
         can_like = bool(self.likes and info["uri"])
         for i, name in enumerate(self.BUTTONS):
-            if name == "like" and not can_like:
-                continue
+            if name == "like" and not can_like or name == "shuffle" and info["shuffle"] not in ("true", "false") \
+                    or name == "repeat" and info["loop"] not in self.REPEAT_NEXT:
+                continue  # this player doesn't support it
             x0 = i * bw
             if self.pressed == name:
                 d.rounded_rectangle((x0 + 6, self.BTN_Y0, x0 + bw - 6, self.BTN_Y1), 10, fill=self.TRACK)
             self._icon(d, name, x0 + bw // 2, (self.BTN_Y0 + self.BTN_Y1) // 2, self.FG,
-                       info["status"] == "Playing", self.liked.get(info["uri"], False))
+                       info, self.liked.get(info["uri"], False))
         return img
 
 
@@ -429,7 +471,7 @@ def stream(port, screen, args):
     while True:
         start = time.monotonic()
         frame = screen.grab()
-        area = (0, 0, W, H) if shown is None else changed_area(frame, shown)
+        area = None if frame is shown else (0, 0, W, H) if shown is None else changed_area(frame, shown)
         if area:
             x0, y0, x1, y1 = area
             if (x1 - x0) * (y1 - y0) > W * H * 0.6:
