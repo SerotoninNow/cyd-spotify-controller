@@ -2,7 +2,8 @@
 // Wi-Fi, so USB only powers it. Set it up once from a PC: python3 cyd_spotify.py --setup-standalone
 //
 // Setup protocol (USB serial, SETUP_BAUD 8N1, one command per line):
-//   PC  -> ESP   "SET key=value"   store a setting: wifi_ssid, wifi_pass, client_id, refresh_token
+//   PC  -> ESP   "SET key=value"   store a setting: wifi_ssid, wifi_user, wifi_pass, client_id,
+//                                  refresh_token (an empty wifi_user means an ordinary password network)
 //                "INFO"            which settings are stored (values are never printed)
 //                "CLEAR"           forget every setting
 //                "REBOOT"
@@ -90,7 +91,7 @@ struct Action {
 static QueueHandle_t actions;
 
 // Settings, read once at boot.
-static String wifiSsid, wifiPass, clientId, refreshToken;
+static String wifiSsid, wifiUser, wifiPass, clientId, refreshToken;
 
 static void setStatus(const String &s) {
   xSemaphoreTake(lock, portMAX_DELAY);
@@ -424,7 +425,13 @@ static void connectWifi() {
   if (status.indexOf("sign-in page") < 0) setStatus("Connecting to Wi-Fi\n" + wifiSsid);  // keep the advice up
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
-  WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
+  if (wifiUser.length()) {
+    // Username and password networks such as eduroam (WPA2-Enterprise, PEAP). The network's
+    // certificate isn't checked, since none is stored.
+    WiFi.begin(wifiSsid.c_str(), WPA2_AUTH_PEAP, wifiUser.c_str(), wifiUser.c_str(), wifiPass.c_str());
+  } else {
+    WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
+  }
   for (int i = 0; i < 300 && WiFi.status() != WL_CONNECTED; i++) delay(100);
   if (WiFi.status() != WL_CONNECTED) {
     setStatus("Can't join Wi-Fi\n" + wifiSsid);
@@ -740,7 +747,7 @@ static void handleCommand(String line) {
   if (line.startsWith("SET ")) {
     int eq = line.indexOf('=');
     String key = line.substring(4, eq);
-    static const char *allowed[] = {"wifi_ssid", "wifi_pass", "client_id", "refresh_token"};
+    static const char *allowed[] = {"wifi_ssid", "wifi_user", "wifi_pass", "client_id", "refresh_token"};
     for (const char *k : allowed) {
       if (eq > 4 && key == k) {
         prefs.putString(k, line.substring(eq + 1));
@@ -750,8 +757,9 @@ static void handleCommand(String line) {
     }
     Serial.println("ERR unknown setting");
   } else if (line == "INFO") {
-    Serial.printf("wifi_ssid=%s wifi_pass=%s client_id=%s refresh_token=%s\n",
-                  prefs.isKey("wifi_ssid") ? "set" : "missing", prefs.isKey("wifi_pass") ? "set" : "missing",
+    Serial.printf("wifi_ssid=%s wifi_user=%s wifi_pass=%s client_id=%s refresh_token=%s\n",
+                  prefs.isKey("wifi_ssid") ? "set" : "missing",
+                  prefs.getString("wifi_user").length() ? "set" : "none", prefs.isKey("wifi_pass") ? "set" : "missing",
                   prefs.isKey("client_id") ? "set" : "missing", prefs.isKey("refresh_token") ? "set" : "missing");
     Serial.println("OK");
   } else if (line == "CLEAR") {
@@ -797,6 +805,7 @@ void setup() {
 
   prefs.begin("cyd-spotify");
   wifiSsid = prefs.getString("wifi_ssid");
+  wifiUser = prefs.getString("wifi_user");
   wifiPass = prefs.getString("wifi_pass");
   clientId = prefs.getString("client_id");
   refreshToken = prefs.getString("refresh_token");

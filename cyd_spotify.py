@@ -153,13 +153,14 @@ def setup_standalone(port_name, client_id):
         print("Found the CYD.\n")
 
         ssid = input("Wi-Fi network name (2.4 GHz): ").strip()
+        user = input("Username, for networks like eduroam (press Enter if there is none): ").strip()
         password = getpass.getpass("Wi-Fi password (not shown): ")
-        if not ssid or "\n" in ssid + password:
-            raise SystemExit("That network name or password can't be used.")
+        if not ssid or "\n" in ssid + user + password:
+            raise SystemExit("That network name, username or password can't be used.")
         token = spotify_authorize(
             client_id, "user-read-playback-state user-modify-playback-state user-library-read user-library-modify",
             "show and control your Spotify playback")
-        for key, value in (("wifi_ssid", ssid), ("wifi_pass", password), ("client_id", client_id),
+        for key, value in (("wifi_ssid", ssid), ("wifi_user", user), ("wifi_pass", password), ("client_id", client_id),
                            ("refresh_token", token)):
             command(f"SET {key}={value}")
         command("REBOOT")

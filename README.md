@@ -107,10 +107,17 @@ developer dashboard, the redirect URI `http://127.0.0.1:8898/callback` must be l
 python3 cyd_spotify.py --setup-standalone
 ```
 
-It asks for your Wi-Fi name and password (2.4 GHz networks only; the ESP32 has no 5 GHz radio),
+It asks for your Wi-Fi name, a username (only for networks like eduroam; press Enter otherwise)
+and password (2.4 GHz networks only; the ESP32 has no 5 GHz radio),
 opens Spotify in the browser to approve access, then sends both to the CYD, which keeps them in
 its own flash and restarts. Nothing is saved on the computer. If you never ran `--spotify-login`,
 add your Client ID after `--setup-standalone`.
+
+For eduroam, the username is your full school address (`you@school.edu`). Username networks
+use PEAP, and the network's certificate is not checked, so a fake network with the same name
+could collect the login: if your school offers a separate device or Wi-Fi password, use that.
+Guest networks with a sign-in web page don't work; the screen says so and shows the board's MAC
+address, which some networks let you register instead.
 
 Run the setup again to change Wi-Fi network. Anyone who has the board and a USB cable can read
 the stored Wi-Fi password and Spotify sign-in back out of it, so treat it like a signed-in phone.
