@@ -146,6 +146,11 @@ static bool ensureToken() {
                        "&client_id=" + urlEncode(clientId));
   String body = http.getString();
   http.end();
+  if (code < 0) {
+    char err[100];
+    tls.lastError(err, sizeof(err));
+    Serial.printf("token: %s; TLS: %s\n", http.errorToString(code).c_str(), err);
+  }
   if (code != 200) {
     Serial.printf("token: HTTP %d %s\n", code, body.c_str());
     setStatus(code == 400 ? "Spotify sign-in expired.\nRun the setup again." : "Can't reach Spotify (" + String(code) + ")");
@@ -374,6 +379,30 @@ static void run(const Action &a) {
   if (a.button == B_LIKE) likedChecked = "";  // re-read the real state
 }
 
+// Guest networks often hold everything back until someone signs in on a web page, which this
+// board can't do. A plain-HTTP check page tells: it answers 204 only on an open connection.
+// Its Date header also sets the clock on networks that block time servers.
+static bool internetReachable() {
+  WiFiClient tcp;
+  HTTPClient http;
+  static const char *keep[] = {"Date"};
+  http.collectHeaders(keep, 1);
+  http.setTimeout(8000);
+  http.begin(tcp, "http://connectivitycheck.gstatic.com/generate_204");
+  int code = http.GET();
+  String date = http.header("Date");
+  http.end();
+  Serial.printf("internet check: HTTP %d\n", code);
+  if (code != 204) return false;
+  struct tm t = {};
+  if (time(nullptr) < 1700000000 && strptime(date.c_str(), "%a, %d %b %Y %H:%M:%S", &t)) {
+    struct timeval tv = {mktime(&t), 0};  // the board's time zone is UTC, like the header
+    settimeofday(&tv, nullptr);
+    Serial.println("clock: set from the HTTP Date header");
+  }
+  return true;
+}
+
 static void connectWifi() {
   if (WiFi.status() == WL_CONNECTED) return;
   setStatus("Connecting to Wi-Fi\n" + wifiSsid);
@@ -387,10 +416,22 @@ static void connectWifi() {
     delay(5000);
     return;
   }
-  Serial.printf("Wi-Fi: %s\n", WiFi.localIP().toString().c_str());
+  Serial.printf("Wi-Fi: %s, MAC %s\n", WiFi.localIP().toString().c_str(), WiFi.macAddress().c_str());
   // Certificates are checked against the clock, which starts at 1970.
   configTime(0, 0, "pool.ntp.org", "time.google.com");
   for (int i = 0; i < 100 && time(nullptr) < 1700000000; i++) delay(100);
+  while (!internetReachable()) {
+    setStatus("This Wi-Fi wants a sign-in page.\nRegister MAC " + WiFi.macAddress());
+    delay(30000);
+    if (WiFi.status() != WL_CONNECTED) return;
+  }
+  if (time(nullptr) < 1700000000) {
+    setStatus("Can't get the time from\nthe internet; Spotify needs it.");
+    delay(30000);
+    return;
+  }
+  time_t now = time(nullptr);
+  Serial.printf("clock: %s", ctime(&now));
   setStatus("Connecting to Spotify...");
 }
 
