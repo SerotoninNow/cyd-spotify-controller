@@ -88,7 +88,6 @@ struct Action {
   String uri;
 };
 static QueueHandle_t actions;
-static uint8_t *artBuf;  // the downloaded cover; reserved at boot while memory is still in one piece
 
 // Settings, read once at boot.
 static String wifiSsid, wifiPass, clientId, refreshToken;
@@ -139,7 +138,10 @@ static bool ensureToken() {
   apiTls.stop();  // two TLS sessions at once is more than this board's memory can hold
   WiFiClientSecure tls;
   tls.setCACert(SPOTIFY_ROOT_CAS);
+  tls.setHandshakeTimeout(15);
   HTTPClient http;
+  http.setConnectTimeout(10000);
+  http.setTimeout(10000);
   http.begin(tls, "https://accounts.spotify.com/api/token");
   http.addHeader("Content-Type", "application/x-www-form-urlencoded");
   int code = http.POST("grant_type=refresh_token&refresh_token=" + urlEncode(refreshToken) +
@@ -173,8 +175,12 @@ static bool ensureToken() {
 static int api(const char *method, const String &path, String *body = nullptr) {
   if ((int32_t)(backoffUntil - millis()) > 0) return -2;
   if (!ensureToken()) return -1;
+  static bool first = true;
+  if (first) Serial.printf("signed in to Spotify; free heap %u\n", ESP.getFreeHeap());
+  first = false;
   apiHttp.setReuse(true);
   apiHttp.setTimeout(8000);
+  apiHttp.setConnectTimeout(10000);
   apiHttp.begin(apiTls, "https://api.spotify.com/v1" + path);
   apiHttp.addHeader("Authorization", "Bearer " + accessToken);
   static const char *keep[] = {"Retry-After"};
@@ -186,7 +192,9 @@ static int api(const char *method, const String &path, String *body = nullptr) {
     apiHttp.addHeader("Content-Length", "0");  // Spotify rejects a PUT/POST without it
     code = apiHttp.sendRequest(method, (uint8_t *)nullptr, 0);
   }
-  String text = code > 0 ? apiHttp.getString() : String();  // read it all so the connection can be reused
+  // Read the body so the connection can be reused, but not after 204: there is none, and with
+  // no length given and the connection kept open, reading would wait for ever.
+  String text = code > 0 && code != 204 && code != 304 ? apiHttp.getString() : String();
   if (code == 429) {
     int wait = max(1, (int)apiHttp.header("Retry-After").toInt());
     backoffUntil = millis() + wait * 1000;
@@ -194,7 +202,13 @@ static int api(const char *method, const String &path, String *body = nullptr) {
   }
   apiHttp.end();
   if (code == 401) accessToken = "";  // expired early; get a new one next time
-  if (code < 0) apiTls.stop();
+  if (code < 0) {
+    char err[100];
+    apiTls.lastError(err, sizeof(err));
+    Serial.printf("%s %s: %s; TLS: %s; free heap %u, largest block %u\n", method, path.c_str(),
+                  HTTPClient::errorToString(code).c_str(), err, ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+    apiTls.stop();
+  }
   if (body) *body = text;
   return code;
 }
@@ -218,9 +232,8 @@ static int artDraw(JPEGDRAW *d) {
 }
 
 static void loadArt(const String &url) {
-  uint8_t *buf = artBuf;
   bool ok = false;
-  if (buf && url.length()) {
+  if (url.length()) {
     apiTls.stop();  // as in ensureToken()
     WiFiClientSecure tls;
     tls.setCACert(SPOTIFY_ROOT_CAS);
@@ -230,7 +243,9 @@ static void loadArt(const String &url) {
     http.begin(tls, url);
     int code = http.GET();
     int len = http.getSize();
-    if (code == 200 && len > 0 && (size_t)len <= ART_MAX) {
+    // Borrowed only while a cover loads: TLS needs that memory the rest of the time.
+    uint8_t *buf = code == 200 && len > 0 && (size_t)len <= ART_MAX ? (uint8_t *)malloc(len) : nullptr;
+    if (buf) {
       WiFiClient *s = http.getStreamPtr();
       int got = 0;
       uint32_t start = millis();
@@ -247,8 +262,9 @@ static void loadArt(const String &url) {
         ok = jpeg.decode(0, 0, scale ? (1 << scale) : 0) == 1;  // JPEG_SCALE_HALF == 2, and so on
         jpeg.close();
       }
+      free(buf);
     } else {
-      Serial.printf("art: HTTP %d, %d bytes\n", code, len);
+      Serial.printf("art: HTTP %d, %d bytes, largest free block %u\n", code, len, ESP.getMaxAllocHeap());
     }
     http.end();
   }
@@ -405,7 +421,7 @@ static bool internetReachable() {
 
 static void connectWifi() {
   if (WiFi.status() == WL_CONNECTED) return;
-  setStatus("Connecting to Wi-Fi\n" + wifiSsid);
+  if (status.indexOf("sign-in page") < 0) setStatus("Connecting to Wi-Fi\n" + wifiSsid);  // keep the advice up
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
   WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
@@ -420,10 +436,11 @@ static void connectWifi() {
   // Certificates are checked against the clock, which starts at 1970.
   configTime(0, 0, "pool.ntp.org", "time.google.com");
   for (int i = 0; i < 100 && time(nullptr) < 1700000000; i++) delay(100);
-  while (!internetReachable()) {
+  if (!internetReachable()) {
     setStatus("This Wi-Fi wants a sign-in page.\nRegister MAC " + WiFi.macAddress());
     delay(30000);
-    if (WiFi.status() != WL_CONNECTED) return;
+    WiFi.disconnect();  // rejoin, so a newly registered board gets its proper address
+    return;
   }
   if (time(nullptr) < 1700000000) {
     setStatus("Can't get the time from\nthe internet; Spotify needs it.");
@@ -437,6 +454,7 @@ static void connectWifi() {
 
 static void networkTask(void *) {
   apiTls.setCACert(SPOTIFY_ROOT_CAS);
+  apiTls.setHandshakeTimeout(15);
   uint32_t nextPoll = 0;
   for (;;) {
     connectWifi();
@@ -785,7 +803,6 @@ void setup() {
 
   lock = xSemaphoreCreateMutex();
   actions = xQueueCreate(8, sizeof(Action *));
-  artBuf = (uint8_t *)malloc(ART_MAX);
   Serial.println("CYD-STANDALONE READY");
   if (!wifiSsid.length() || !clientId.length() || !refreshToken.length()) {
     status = "Not set up yet. On a PC, run\ncyd_spotify.py --setup-standalone";
