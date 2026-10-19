@@ -31,7 +31,7 @@ class CydLink(
     private var characteristic: BluetoothGattCharacteristic? = null
     private var address: String? = null
     private var deviceName = "CYD"
-    private var maxWrite = 20  // bytes per write: the MTU less 3
+    private var maxWrite = 20  // bytes per write: the MTU less 3, at most MAX_VALUE
     private var busy = false
     private var refreshed = false  // asked Android to forget its cached service list
 
@@ -105,7 +105,14 @@ class CydLink(
             coverQueue.isNotEmpty() -> coverQueue.removeFirst()
             else -> null
         } ?: return
-        if (write(g, c, packet)) {
+        val sent = try {
+            write(g, c, packet)
+        } catch (e: Exception) {  // a packet Android refuses outright: skip it rather than crash
+            Log.w(TAG, "write refused", e)
+            handler.post { pump() }
+            return
+        }
+        if (sent) {
             busy = true
         } else {  // the stack is busy with something else: try again shortly
             if (packet[0].toInt() == 1) songDirty = true else coverQueue.addFirst(packet)
@@ -171,7 +178,7 @@ class CydLink(
         override fun onMtuChanged(g: BluetoothGatt, mtu: Int, status: Int) {
             handler.post {
                 if (g != gatt) return@post
-                maxWrite = (if (status == BluetoothGatt.GATT_SUCCESS) mtu else 23) - 3
+                maxWrite = minOf((if (status == BluetoothGatt.GATT_SUCCESS) mtu else 23) - 3, MAX_VALUE)
                 Log.i(TAG, "MTU $mtu, writes of up to $maxWrite bytes")
                 g.discoverServices()
             }
@@ -205,5 +212,7 @@ class CydLink(
 
     companion object {
         private const val TAG = "CydLink"
+        // Android refuses longer writes even when the MTU would allow more (517 - 3 = 514).
+        private const val MAX_VALUE = 512
     }
 }
