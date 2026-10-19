@@ -183,6 +183,22 @@ CYD calls the last phone itself.
 
 **Going back**: flash `-e cyd`, `-e standalone` (or their `2usb` versions) again.
 
+## Bluetooth remote: buttons only (experimental)
+
+The CYD pairs as a Bluetooth media remote, like the media keys on a keyboard or a Bluetooth
+media button: previous, play/pause, next, volume down and volume up. The phone (or computer)
+keeps playing through its own speaker or headphones, and the volume buttons change its volume.
+Remotes can't receive song details, so there is no title or cover; for those, use the Bluetooth
+speaker version above, or the USB version with a computer.
+
+```bash
+.venv/bin/pio run -d firmware -e remote -t upload
+```
+
+Use `-e remote2usb` for the two-port board. Then pick **CYD Remote** in your phone's Bluetooth
+settings. If the phone has paired with the speaker version before, forget "CYD Player" on the
+phone first: both use the board's address, and the old entry can block pairing.
+
 ## Troubleshooting
 
 - **Touches land off-target**: adjust the `TOUCH_*_MIN/MAX` values in `firmware/src/main.cpp`.
