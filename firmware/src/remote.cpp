@@ -1,20 +1,35 @@
 // ESP32-2432S028 (CYD) as a Bluetooth media remote. It pairs as a Bluetooth LE media-key
 // device (HID consumer control, like the media keys on a keyboard), so the phone or computer
 // keeps playing through its own speaker or headphones. Buttons: previous, play/pause, next,
-// volume down and up. A remote can't receive song details, so there is no title or cover.
+// volume down and up.
+//
+// A remote can't receive song details by itself. The companion Android app (android/ in this
+// repository) fills that gap: it reads what's playing on the phone and writes it to a second
+// service on the same Bluetooth LE connection. While it does, the screen shows the title,
+// artist, album, cover and progress above smaller buttons; without it, just the big buttons.
+//
+// Now-playing service: one characteristic, written by the app. Every write is one packet whose
+// first byte is its type; numbers are little-endian.
+//   0x01 song    state (0 nothing, 1 paused, 2 playing), volume % (255 unknown),
+//                position ms (u32), duration ms (u32, 0 unknown),
+//                then title, artist, album and player name, UTF-8, each ending in a 0 byte
+//   0x02 cover   id (u32), JPEG length (u32, 0: no cover)
+//   0x03 piece   id (u32), offset (u32), JPEG bytes; the cover shows once all have arrived
 //
 // Serial (SETUP_BAUD): a log.
+//
+// Bluetooth callbacks run in the Bluetooth task; the Arduino loop draws and reads the
+// touchscreen. They share `song` and the finished cover under `lock`.
 
 #include <Arduino.h>
 #include <BLEDevice.h>
 #include <BLEHIDDevice.h>
 #include <BLESecurity.h>
 #include <BLEServer.h>
+#include <JPEGDEC.h>
 #include <SPI.h>
 #include <TFT_eSPI.h>
 #include <XPT2046_Touchscreen.h>
-
-#include <atomic>
 
 #ifndef SETUP_BAUD
 #define SETUP_BAUD 115200
@@ -22,6 +37,10 @@
 #ifndef BT_NAME
 #define BT_NAME "CYD Remote"
 #endif
+
+// Must match android/app/src/main/java/com/cyd/nowplaying/Protocol.kt.
+#define NOW_PLAYING_SERVICE "8d5f0001-3c4b-4f1e-9a57-6b1c2d0e7a10"
+#define NOW_PLAYING_CHAR "8d5f0002-3c4b-4f1e-9a57-6b1c2d0e7a10"
 
 // The touch controller sits on its own SPI bus on this board.
 #define TOUCH_IRQ 36
@@ -37,9 +56,18 @@
 #define TOUCH_Y_MAX 3800
 
 static const int W = 320, H = 240;
+
+// Buttons only (no app):
 static const int TOP_H = 44;                  // status bar
 static const int ROW1_Y0 = 52, ROW1_Y1 = 140;  // previous, play/pause, next
 static const int ROW2_Y0 = 148, ROW2_Y1 = 232; // volume down, volume up
+
+// Now playing (the app is sending song details), laid out like the Bluetooth speaker version:
+static const int ART = 128, ART_X = 12, ART_Y = 12;
+static const int TEXT_X = ART_X + ART + 12, TEXT_W = W - TEXT_X - 12;
+static const int BAR_Y = 156;
+static const int BTN_Y0 = 186, BTN_Y1 = 234;
+static const size_t ART_MAX = 32768;  // the app sends 128x128 JPEGs, usually under 10 KB
 
 enum Button : uint8_t { B_PREV, B_PLAY, B_NEXT, B_VOL_DOWN, B_VOL_UP, N_BUTTONS, B_NONE = 255 };
 
@@ -47,6 +75,7 @@ enum Button : uint8_t { B_PREV, B_PLAY, B_NEXT, B_VOL_DOWN, B_VOL_UP, N_BUTTONS,
 static const uint16_t USAGE[N_BUTTONS] = {0xB6, 0xCD, 0xB5, 0xEA, 0xE9};
 
 static TFT_eSPI tft;
+static JPEGDEC jpeg;
 static SPIClass touchSpi(VSPI);
 static XPT2046_Touchscreen touch(TOUCH_CS, TOUCH_IRQ);
 static uint16_t BG, FG, DIM, TRACK, ACCENT;
@@ -67,24 +96,164 @@ static const uint8_t REPORT_MAP[] = {
     0xC0,              // End Collection
 };
 
+// --- state shared between the Bluetooth task and the loop (guarded by `lock`) ---
+
+struct Song {
+  bool fromApp = false;  // the app has sent song details on this connection
+  bool playing = false;
+  uint8_t volume = 255;  // percent, 255 unknown
+  String title, artist, album, source;
+  uint32_t durationMs = 0, progressMs = 0, at = 0;  // progressMs as read at millis() == at
+};
+
+static SemaphoreHandle_t lock;
+static Song song;
+static uint32_t version = 1;  // bumped whenever the screen should be redrawn
+
+// A cover arrives in pieces in the Bluetooth task and is decoded by the loop.
+static uint8_t *artBuf = nullptr;  // being received (Bluetooth task only)
+static size_t artLen = 0, artTotal = 0;
+static uint32_t artId = 0;
+static uint8_t *artReady = nullptr;  // complete, waiting to be decoded (guarded by `lock`)
+static size_t artReadyLen = 0;
+static bool artClear = false;     // the song has no cover: show the placeholder
+static uint32_t artVersion = 0;   // bumped when the loop should redraw the art area
+
+static uint16_t artPixels[ART * ART];
+static bool artValid = false;  // loop only
+
 static BLEHIDDevice *hid;
 static BLECharacteristic *input;
 static volatile bool connected = false;
-static std::atomic<uint32_t> version{1};  // bumped whenever the status bar should be redrawn
-static String notice;                  // shown briefly in the status bar (loop only)
+static String notice;  // shown briefly in the status line (loop only)
 static uint32_t noticeUntil = 0;
+
+static void bump() {
+  xSemaphoreTake(lock, portMAX_DELAY);
+  version++;
+  xSemaphoreGive(lock);
+}
+
+// --- now-playing service (Bluetooth task) ---
+
+static uint32_t readU32(const uint8_t *p) { return p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24; }
+
+// The next 0-terminated string from p, or what's left of the packet without one.
+static String takeString(const uint8_t *&p, const uint8_t *end) {
+  const uint8_t *s = p;
+  while (p < end && *p) p++;
+  String out;
+  out.concat((const char *)s, p - s);
+  if (p < end) p++;
+  return out;
+}
+
+static void dropArt() {
+  free(artBuf);
+  artBuf = nullptr;
+  artLen = artTotal = 0;
+}
+
+static void showNoArt() {
+  xSemaphoreTake(lock, portMAX_DELAY);
+  free(artReady);
+  artReady = nullptr;
+  artClear = true;
+  artVersion++;
+  xSemaphoreGive(lock);
+}
+
+static void onSong(const uint8_t *d, size_t n) {
+  if (n < 11) return;
+  const uint8_t *p = d + 11, *end = d + n;
+  Song s;
+  s.fromApp = true;
+  s.playing = d[1] == 2;
+  s.volume = d[2];
+  s.progressMs = readU32(d + 3);
+  s.durationMs = readU32(d + 7);
+  s.at = millis();
+  s.title = takeString(p, end);
+  s.artist = takeString(p, end);
+  s.album = takeString(p, end);
+  s.source = takeString(p, end);
+  xSemaphoreTake(lock, portMAX_DELAY);
+  song = s;
+  version++;
+  xSemaphoreGive(lock);
+}
+
+static void onCover(const uint8_t *d, size_t n) {
+  if (n < 9) return;
+  dropArt();
+  artId = readU32(d + 1);
+  size_t total = readU32(d + 5);
+  if (total == 0 || total > ART_MAX) {
+    if (total) Serial.printf("art: %u bytes is too big\n", (unsigned)total);
+    showNoArt();
+    return;
+  }
+  artBuf = (uint8_t *)malloc(total);
+  if (artBuf) artTotal = total;
+}
+
+static void onPiece(const uint8_t *d, size_t n) {
+  if (n < 9 || !artBuf || readU32(d + 1) != artId) return;  // an older cover's last pieces
+  size_t offset = readU32(d + 5), len = n - 9;
+  if (offset != artLen || artLen + len > artTotal) {
+    Serial.println("art: pieces out of order, dropped");
+    dropArt();
+    return;
+  }
+  memcpy(artBuf + artLen, d + 9, len);
+  artLen += len;
+  if (artLen < artTotal) return;
+  xSemaphoreTake(lock, portMAX_DELAY);
+  free(artReady);
+  artReady = artBuf;
+  artReadyLen = artLen;
+  artClear = false;
+  artVersion++;
+  xSemaphoreGive(lock);
+  artBuf = nullptr;
+  artLen = artTotal = 0;
+}
+
+class NowPlayingWrites : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *c) override {
+    String v = c->getValue();
+    const uint8_t *d = (const uint8_t *)v.c_str();
+    size_t n = v.length();
+    if (!n) return;
+    switch (d[0]) {
+      case 0x01: onSong(d, n); break;
+      case 0x02: onCover(d, n); break;
+      case 0x03: onPiece(d, n); break;
+    }
+  }
+};
+
+// --- Bluetooth ---
 
 class ServerEvents : public BLEServerCallbacks {
   void onConnect(BLEServer *) override {
     connected = true;
-    version++;
+    bump();
     Serial.println("ble: connected");
   }
   void onDisconnect(BLEServer *) override {
     connected = false;
+    dropArt();
+    showNoArt();
+    xSemaphoreTake(lock, portMAX_DELAY);
+    song = Song();  // back to the big buttons until the app speaks again
     version++;
+    xSemaphoreGive(lock);
     Serial.println("ble: disconnected");
     BLEDevice::startAdvertising();  // visible again for this or another device
+  }
+  void onMtuChanged(BLEServer *, esp_ble_gatts_cb_param_t *param) override {
+    Serial.printf("ble: MTU %u\n", param->mtu.mtu);
   }
 };
 
@@ -100,6 +269,7 @@ class SecurityEvents : public BLESecurityCallbacks {
 
 static void startBle() {
   BLEDevice::init(BT_NAME);
+  BLEDevice::setMTU(517);  // the app sends covers in pieces of up to 500 bytes
   BLESecurity *security = new BLESecurity();
   security->setCapability(ESP_IO_CAP_NONE);  // "just works" pairing, no code to type
   security->setAuthenticationMode(true, false, true);  // bond, no MITM, secure connections
@@ -115,6 +285,12 @@ static void startBle() {
   input = hid->inputReport(1);
   hid->setBatteryLevel(100);
   hid->startServices();
+
+  BLEService *np = server->createService(NOW_PLAYING_SERVICE);
+  BLECharacteristic *npChar = np->createCharacteristic(
+      NOW_PLAYING_CHAR, BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR);
+  npChar->setCallbacks(new NowPlayingWrites());
+  np->start();
 
   BLEAdvertising *adv = BLEDevice::getAdvertising();
   adv->setAppearance(0x0180);  // generic remote control
@@ -135,15 +311,115 @@ static void tap(uint8_t b) {
   if (!connected) {
     notice = "Not connected yet";
     noticeUntil = millis() + 2000;
-    version++;
+    bump();
     return;
+  }
+  if (b == B_PLAY) {  // show the change straight away; the app confirms it
+    xSemaphoreTake(lock, portMAX_DELAY);
+    if (song.fromApp) {
+      uint32_t now = millis();
+      song.progressMs += song.playing ? now - song.at : 0;
+      song.at = now;
+      song.playing = !song.playing;
+      version++;
+    }
+    xSemaphoreGive(lock);
   }
   sendUsage(USAGE[b]);
   delay(10);
   sendUsage(0);
 }
 
-// --- drawing ---
+// --- album art (loop only) ---
+
+static int artW, artH;  // size of the decoded (scaled) image
+
+// JPEGDEC hands over blocks of the decoded image; this samples them down to ART x ART.
+static int artDraw(JPEGDRAW *d) {
+  for (int dy = 0; dy < ART; dy++) {
+    int sy = dy * artH / ART;
+    if (sy < d->y || sy >= d->y + d->iHeight) continue;
+    for (int dx = 0; dx < ART; dx++) {
+      int sx = dx * artW / ART;
+      if (sx < d->x || sx >= d->x + d->iWidth) continue;
+      artPixels[dy * ART + dx] = d->pPixels[(sy - d->y) * d->iWidth + (sx - d->x)];
+    }
+  }
+  return 1;
+}
+
+static void decodeArt(uint8_t *buf, size_t len) {
+  artValid = false;
+  if (jpeg.openRAM(buf, len, artDraw)) {
+    int scale = 0, w = jpeg.getWidth(), h = jpeg.getHeight();
+    while (scale < 3 && w >> (scale + 1) >= ART && h >> (scale + 1) >= ART) scale++;
+    artW = w >> scale;
+    artH = h >> scale;
+    artValid = jpeg.decode(0, 0, scale ? (1 << scale) : 0) == 1;  // JPEG_SCALE_HALF == 2, and so on
+    jpeg.close();
+  }
+  if (!artValid) Serial.printf("art: couldn't decode %u bytes\n", (unsigned)len);
+}
+
+// --- drawing (loop only) ---
+
+// The built-in fonts only cover ASCII, so accented Latin letters lose their accents and
+// anything else becomes '?'.
+static String toAscii(const String &s) {
+  static const char *latin1 = "AAAAAAACEEEEIIIIDNOOOOOxOUUUUYTsaaaaaaaceeeeiiiidnooooo/ouuuuyty";
+  String out;
+  for (size_t i = 0; i < s.length(); i++) {
+    uint8_t c = s[i];
+    if (c < 0x80) {
+      out += (char)c;
+      continue;
+    }
+    uint32_t cp = 0;
+    int extra = c >= 0xF0 ? 3 : c >= 0xE0 ? 2 : c >= 0xC0 ? 1 : 0;
+    cp = c & (0x3F >> extra);
+    for (int k = 0; k < extra && i + 1 < s.length(); k++) cp = (cp << 6) | (s[++i] & 0x3F);
+    if (cp >= 0xC0 && cp <= 0xFF) out += latin1[cp - 0xC0];
+    else if (cp == 0x2018 || cp == 0x2019) out += '\'';
+    else if (cp == 0x201C || cp == 0x201D) out += '"';
+    else if (cp == 0x2013 || cp == 0x2014) out += '-';
+    else if (cp == 0x2026) out += "...";
+    else out += '?';
+  }
+  return out;
+}
+
+static String fitText(String s, int width) {
+  if (tft.textWidth(s) <= width) return s;
+  while (s.length() && tft.textWidth(s + "...") > width) s.remove(s.length() - 1);
+  s.trim();
+  return s + "...";
+}
+
+// Draws up to `lines` word-wrapped lines from y; returns the y below the last one.
+static int drawWrapped(const String &text, int x, int y, int width, int lines, int lineH, uint16_t color) {
+  tft.setTextColor(color);
+  String rest = text;
+  rest.trim();
+  for (int n = 0; n < lines && rest.length(); n++) {
+    String line;
+    int cut = 0;
+    while (cut < (int)rest.length()) {
+      int sp = rest.indexOf(' ', cut + 1);
+      if (sp < 0) sp = rest.length();
+      if (line.length() && tft.textWidth(rest.substring(0, sp)) > width) break;
+      line = rest.substring(0, sp);
+      cut = sp;
+    }
+    rest = rest.substring(cut);
+    rest.trim();
+    if (n == lines - 1 && rest.length()) line = line + " " + rest;
+    tft.drawString(fitText(line, width), x, y);
+    y += lineH;
+  }
+  return y;
+}
+
+// Buttons only:
 
 static void buttonRect(int b, int &x0, int &y0, int &w, int &h) {
   if (b <= B_NEXT) {
@@ -159,11 +435,10 @@ static void buttonRect(int b, int &x0, int &y0, int &w, int &h) {
   }
 }
 
-static void drawStatus() {
+static void drawStatus(bool noticeOn) {
   tft.fillRect(0, 0, W, TOP_H, BG);
   tft.setTextDatum(ML_DATUM);
   tft.setFreeFont(&FreeSansBold9pt7b);
-  bool noticeOn = notice.length() && (int32_t)(noticeUntil - millis()) > 0;
   if (noticeOn) {
     tft.setTextColor(FG);
     tft.drawString(notice, 12, TOP_H / 2);
@@ -180,12 +455,7 @@ static void drawStatus() {
   tft.setTextDatum(TL_DATUM);
 }
 
-static void drawSpeaker(int cx, int cy, uint16_t c) {
-  tft.fillRect(cx - 22, cy - 8, 10, 17, c);
-  tft.fillTriangle(cx - 14, cy, cx - 1, cy - 16, cx - 1, cy + 16, c);
-}
-
-static void drawButton(int b, bool pressed) {
+static void drawBigButton(int b, bool pressed) {
   int x0, y0, w, h;
   buttonRect(b, x0, y0, w, h);
   int cx = x0 + w / 2, cy = y0 + h / 2;
@@ -200,26 +470,127 @@ static void drawButton(int b, bool pressed) {
       tft.fillRect(cx + s * 19 - 2, cy - 15, 5, 31, c);
       break;
     }
-    case B_PLAY:  // a remote can't tell which, so both
+    case B_PLAY:  // without the app the remote can't tell which, so both
       tft.fillTriangle(cx - 22, cy - 16, cx - 22, cy + 16, cx + 2, cy, c);
       tft.fillRect(cx + 8, cy - 16, 7, 33, c);
       tft.fillRect(cx + 20, cy - 16, 7, 33, c);
       break;
     case B_VOL_DOWN:
     case B_VOL_UP:
-      drawSpeaker(cx, cy, c);
+      tft.fillRect(cx - 22, cy - 8, 10, 17, c);  // speaker
+      tft.fillTriangle(cx - 14, cy, cx - 1, cy - 16, cx - 1, cy + 16, c);
       tft.fillRect(cx + 6, cy - 2, 18, 5, c);  // minus
       if (b == B_VOL_UP) tft.fillRect(cx + 13, cy - 9, 5, 19, c);  // plus
       break;
   }
 }
 
+// Now playing:
+
+static void drawText(const Song &s, const String &line) {
+  tft.fillRect(TEXT_X, ART_Y, W - TEXT_X, ART, BG);
+  tft.setTextDatum(TL_DATUM);
+  tft.setFreeFont(&FreeSansBold9pt7b);
+  String title = s.title.length() ? s.title : String(s.playing ? "Playing" : "Nothing playing");
+  int y = drawWrapped(toAscii(title), TEXT_X, ART_Y + 2, TEXT_W, 3, 22, FG) + 4;
+  tft.setFreeFont(&FreeSans9pt7b);
+  y = drawWrapped(toAscii(s.artist), TEXT_X, y, TEXT_W, 2, 20, FG);
+  tft.setTextFont(2);
+  if (s.album.length() && y < 112) {
+    tft.setTextColor(DIM);
+    tft.drawString(fitText(toAscii(s.album), TEXT_W), TEXT_X, y + 2);
+  }
+  tft.setTextColor(DIM);
+  tft.drawString(fitText(toAscii(line), TEXT_W), TEXT_X, ART_Y + ART - 16);
+}
+
+// No cover: a tile with a music note.
+static void drawPlaceholder() {
+  tft.fillRect(ART_X, ART_Y, ART, ART, BG);
+  tft.fillRoundRect(ART_X, ART_Y, ART, ART, 6, TRACK);
+  int cx = ART_X + ART / 2, cy = ART_Y + ART / 2;
+  tft.fillEllipse(cx - 18, cy + 22, 12, 9, DIM);
+  tft.fillEllipse(cx + 18, cy + 14, 12, 9, DIM);
+  tft.fillRect(cx - 9, cy - 28, 5, 50, DIM);
+  tft.fillRect(cx + 27, cy - 36, 5, 50, DIM);
+  for (int i = 0; i < 8; i++) tft.drawLine(cx - 9, cy - 28 + i, cx + 31, cy - 36 + i, DIM);
+}
+
+static void drawArt() {
+  if (artValid) tft.pushImage(ART_X, ART_Y, ART, ART, artPixels);
+  else drawPlaceholder();
+}
+
+static String clockText(uint32_t ms) {
+  uint32_t s = ms / 1000;
+  char buf[12];
+  if (s >= 3600) snprintf(buf, sizeof(buf), "%u:%02u:%02u", s / 3600, s % 3600 / 60, s % 60);
+  else snprintf(buf, sizeof(buf), "%u:%02u", s / 60, s % 60);
+  return buf;
+}
+
+// The progress bar, with the phone's volume in the middle of the line below it.
+static void drawProgress(uint32_t pos, uint32_t len, uint8_t vol) {
+  tft.fillRect(0, BAR_Y, W, 26, BG);
+  tft.fillRoundRect(12, BAR_Y, W - 24, 6, 2, TRACK);
+  tft.setTextFont(2);
+  tft.setTextColor(DIM, BG);
+  if (len) {
+    int filled = (int)((uint64_t)(W - 24) * min(pos, len) / len);
+    if (filled > 0) tft.fillRoundRect(12, BAR_Y, max(6, filled), 6, 2, ACCENT);
+    tft.setTextDatum(TL_DATUM);
+    tft.drawString(clockText(pos), 12, BAR_Y + 9);
+    tft.setTextDatum(TR_DATUM);
+    tft.drawString(clockText(len), W - 12, BAR_Y + 9);
+  }
+  if (vol <= 100) {
+    tft.setTextDatum(TC_DATUM);
+    tft.drawString(String("Volume ") + vol + "%", W / 2, BAR_Y + 9);
+  }
+  tft.setTextDatum(TL_DATUM);
+}
+
+static void drawSmallButton(int b, bool playing, bool pressed) {
+  int bw = W / N_BUTTONS, x0 = b * bw, cx = x0 + bw / 2, cy = (BTN_Y0 + BTN_Y1) / 2;
+  tft.fillRect(x0, BTN_Y0 - 2, bw, H - BTN_Y0 + 2, BG);
+  if (pressed) tft.fillRoundRect(x0 + 6, BTN_Y0, bw - 12, BTN_Y1 - BTN_Y0, 10, TRACK);
+  switch (b) {
+    case B_PLAY:
+      if (playing) {
+        tft.fillRect(cx - 9, cy - 11, 7, 23, FG);
+        tft.fillRect(cx + 3, cy - 11, 7, 23, FG);
+      } else {
+        tft.fillTriangle(cx - 8, cy - 12, cx - 8, cy + 12, cx + 12, cy, FG);
+      }
+      break;
+    case B_PREV:
+    case B_NEXT: {
+      int s = b == B_PREV ? -1 : 1;
+      for (int off : {-8, 2}) tft.fillTriangle(cx + s * off, cy - 9, cx + s * off, cy + 9, cx + s * (off + 10), cy, FG);
+      tft.fillRect(cx + s * 12 - 1, cy - 9, 3, 19, FG);
+      break;
+    }
+    case B_VOL_DOWN:
+    case B_VOL_UP:
+      tft.fillRect(cx - 14, cy - 5, 6, 11, FG);  // speaker
+      tft.fillTriangle(cx - 9, cy, cx - 1, cy - 10, cx - 1, cy + 10, FG);
+      tft.fillRect(cx + 3, cy - 1, 11, 3, FG);  // minus
+      if (b == B_VOL_UP) tft.fillRect(cx + 7, cy - 5, 3, 11, FG);  // plus
+      break;
+  }
+}
+
 // --- touch ---
 
+static bool nowPlayingLayout = false;  // which layout is on screen (loop only)
 static uint8_t pressedButton = B_NONE;
 static uint32_t pressedSince = 0, lastRepeat = 0;
 
 static uint8_t buttonAt(int x, int y) {
+  if (nowPlayingLayout) {
+    if (y < BTN_Y0 - 8) return B_NONE;
+    return constrain(x * N_BUTTONS / W, 0, N_BUTTONS - 1);
+  }
   for (int b = 0; b < N_BUTTONS; b++) {
     int x0, y0, w, h;
     buttonRect(b, x0, y0, w, h);
@@ -240,7 +611,7 @@ static void pollTouch() {
     if (pressedButton == B_NONE) {
       pressedButton = buttonAt(x, y);
       pressedSince = lastRepeat = millis();
-      if (pressedButton != B_NONE) drawButton(pressedButton, true);
+      if (pressedButton != B_NONE) bump();  // draw the highlight
     } else if ((pressedButton == B_VOL_DOWN || pressedButton == B_VOL_UP) && millis() - pressedSince > 500 &&
                millis() - lastRepeat > 150) {
       lastRepeat = millis();  // holding a volume button keeps stepping
@@ -250,7 +621,7 @@ static void pollTouch() {
     uint8_t b = pressedButton;
     bool held = millis() - pressedSince > 500;
     pressedButton = B_NONE;
-    drawButton(b, false);
+    bump();  // clear the highlight
     if (!(held && (b == B_VOL_DOWN || b == B_VOL_UP))) tap(b);
   }
 }
@@ -261,6 +632,7 @@ void setup() {
   Serial.begin(SETUP_BAUD);
   tft.init();
   tft.setRotation(1);
+  tft.setSwapBytes(true);  // JPEGDEC emits little-endian RGB565
   BG = tft.color565(12, 14, 20);
   FG = tft.color565(235, 238, 245);
   DIM = tft.color565(140, 146, 160);
@@ -270,21 +642,75 @@ void setup() {
   touch.begin(touchSpi);
   touch.setRotation(1);
 
-  tft.fillScreen(BG);
-  for (int b = 0; b < N_BUTTONS; b++) drawButton(b, false);
+  lock = xSemaphoreCreateMutex();
   Serial.println("CYD-REMOTE READY");
   startBle();
 }
 
 void loop() {
-  static uint32_t drawnVersion = 0;
-  static bool noticeShown = false;
+  static uint32_t drawnVersion = 0, drawnArt = UINT32_MAX, drawnSecond = UINT32_MAX;
+  static Song shown;
+  static bool firstDraw = true, noticeShown = false;
+  static uint8_t shownPressed = B_NONE;
+
   pollTouch();
-  bool noticeOn = notice.length() && (int32_t)(noticeUntil - millis()) > 0;
-  if (version != drawnVersion || noticeOn != noticeShown) {
-    drawnVersion = version;
-    noticeShown = noticeOn;
-    drawStatus();
+
+  xSemaphoreTake(lock, portMAX_DELAY);
+  uint32_t v = version, av = artVersion;
+  Song s = (v != drawnVersion) ? song : shown;
+  uint8_t *art = nullptr;
+  size_t artBytes = 0;
+  bool clearArt = false;
+  if (av != drawnArt) {
+    art = artReady;
+    artBytes = artReadyLen;
+    artReady = nullptr;
+    clearArt = artClear;
+    artClear = false;
   }
+  xSemaphoreGive(lock);
+
+  if (art) {
+    decodeArt(art, artBytes);
+    free(art);
+  } else if (clearArt) {
+    artValid = false;
+  }
+
+  bool noticeOn = notice.length() && (int32_t)(noticeUntil - millis()) > 0;
+  bool full = firstDraw || s.fromApp != nowPlayingLayout;
+  if (full) {
+    firstDraw = false;
+    nowPlayingLayout = s.fromApp;
+    pressedButton = B_NONE;  // the buttons have moved
+    tft.fillScreen(BG);
+  }
+
+  if (!nowPlayingLayout) {
+    if (full || v != drawnVersion || noticeOn != noticeShown) drawStatus(noticeOn);
+    for (int b = 0; b < N_BUTTONS; b++)
+      if (full || (pressedButton == b) != (shownPressed == b)) drawBigButton(b, pressedButton == b);
+  } else {
+    if (full || av != drawnArt) drawArt();
+    if (full || s.title != shown.title || s.artist != shown.artist || s.album != shown.album ||
+        s.source != shown.source || noticeOn != noticeShown || (!s.title.length() && s.playing != shown.playing))
+      drawText(s, noticeOn ? notice : s.source);
+    uint32_t pos = s.progressMs + (s.playing ? millis() - s.at : 0);
+    if (s.durationMs) pos = min(pos, s.durationMs);
+    if (full || pos / 1000 != drawnSecond || s.durationMs != shown.durationMs || s.volume != shown.volume) {
+      drawnSecond = pos / 1000;
+      drawProgress(pos, s.durationMs, s.volume);
+    }
+    for (int b = 0; b < N_BUTTONS; b++) {
+      bool changed = full || (pressedButton == b) != (shownPressed == b);
+      if (b == B_PLAY) changed |= s.playing != shown.playing;
+      if (changed) drawSmallButton(b, s.playing, pressedButton == b);
+    }
+  }
+  shown = s;
+  shownPressed = pressedButton;
+  noticeShown = noticeOn;
+  drawnVersion = v;
+  drawnArt = av;
   delay(10);
 }

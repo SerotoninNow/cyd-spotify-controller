@@ -183,13 +183,11 @@ CYD calls the last phone itself.
 
 **Going back**: flash `-e cyd`, `-e standalone` (or their `2usb` versions) again.
 
-## Bluetooth remote: buttons only (experimental)
+## Bluetooth remote (experimental)
 
 The CYD pairs as a Bluetooth media remote, like the media keys on a keyboard or a Bluetooth
 media button: previous, play/pause, next, volume down and volume up. The phone (or computer)
 keeps playing through its own speaker or headphones, and the volume buttons change its volume.
-Remotes can't receive song details, so there is no title or cover; for those, use the Bluetooth
-speaker version above, or the USB version with a computer.
 
 ```bash
 .venv/bin/pio run -d firmware -e remote -t upload
@@ -198,6 +196,70 @@ speaker version above, or the USB version with a computer.
 Use `-e remote2usb` for the two-port board. Then pick **CYD Remote** in your phone's Bluetooth
 settings. If the phone has paired with the speaker version before, forget "CYD Player" on the
 phone first: both use the board's address, and the old entry can block pairing.
+
+On its own a remote can't receive song details, so the screen shows just the five big buttons.
+On Android, the companion app below adds the title, artist, album, cover and progress.
+
+### Song details on the remote: the Android app
+
+Android has no built-in way to send what's playing to a remote, so a small app in `android/`
+does it. It reads the phone's active media session (any player: Spotify, YouTube Music,
+podcasts...; no account) and sends it to the CYD over the same Bluetooth LE connection the
+remote already uses. No cable, no Wi-Fi, and the phone's USB port stays free for charging or
+USB-C headphones. While the app is sending, the CYD shows the cover, title, artist, album,
+progress and the phone's volume, with the buttons in a row underneath; the play button shows
+whether it's playing. Without the app it goes back to the big buttons.
+
+**A1. Flash the remote firmware** from this branch (above). Older remote builds lack the
+song-details service.
+
+**A2. Build the app.** You need JDK 17 or newer (21 recommended) and the Android SDK
+(Android Studio installs both; or the command-line tools with `platforms;android-36`). Tell
+Gradle where the SDK is, either with `ANDROID_HOME` or a file `android/local.properties`
+containing `sdk.dir=/path/to/Android/Sdk`, then:
+
+```bash
+cd android && ./gradlew assembleDebug
+```
+
+The APK is `android/app/build/outputs/apk/debug/app-debug.apk`. Opening the `android` folder
+in Android Studio and pressing Run works too.
+
+**A3. Install it.** The simplest way is USB debugging (Settings > About phone > Software
+information, tap *Build number* seven times; then Developer options > *USB debugging*), plug
+the phone in and run:
+
+```bash
+adb install -r android/app/build/outputs/apk/debug/app-debug.apk
+```
+
+Or copy the APK to the phone and open it in My Files, allowing My Files to install unknown
+apps when asked.
+
+**A4. Grant access.** Open **CYD Now Playing** on the phone:
+
+1. *Open notification access*, turn on **CYD Now Playing**, and confirm. This is how Android
+   lets an app see other apps' media sessions; the app doesn't read your notifications.
+   If the switch is greyed out with "Restricted setting" (Android 13 and newer, for apps
+   installed from a file rather than a store or adb): go to Settings > Apps >
+   CYD Now Playing, tap the ⋮ menu at the top right, choose *Allow restricted settings*,
+   confirm with your PIN or fingerprint, then try again.
+2. *Allow* nearby devices (the Bluetooth permission).
+3. Under *Your CYD*, pick **CYD Remote** (picked by default when it's the only one with "CYD"
+   in its name).
+
+The status line should read "Connected to CYD Remote". After that the app needs no attention:
+it runs in the background whenever notification access is on, and reconnects by itself.
+
+On Samsung phones, keep it from being put to sleep: Settings > Apps > CYD Now Playing >
+Battery > **Unrestricted** (or add it to *Never sleeping apps* under Settings > Battery >
+Background usage limits).
+
+- **No cover**: some apps don't share one with Android; the title still shows.
+- **"has no now-playing service"**: the CYD still runs the old remote firmware, or Android
+  remembers the old one. Flash it again, then forget CYD Remote in Bluetooth settings and pair
+  again.
+- Titles in non-Latin scripts show as `?`, as in the other versions.
 
 ## Troubleshooting
 
@@ -208,5 +270,7 @@ phone first: both use the board's address, and the old entry can block pairing.
 - **Seeing touches**: run with `CYD_DEBUG=1` to print each touch and the button it hit.
 - **Bluetooth version misbehaving**: `.venv/bin/pio device monitor -d firmware -e bluetooth`
   shows its log (connections, sample rate, whether the phone offers covers).
+- **Remote or its app misbehaving**: `.venv/bin/pio device monitor -d firmware -e remote` shows
+  the CYD's side (connections, MTU, covers); `adb logcat -s CydLink MediaListener` the app's.
 - **Standalone version misbehaving**: `.venv/bin/pio device monitor -d firmware -e standalone` shows
   its log (Wi-Fi, Spotify errors). Close it before running the setup.

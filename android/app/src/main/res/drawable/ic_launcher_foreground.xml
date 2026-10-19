@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- A small screen with a music note, in the CYD firmware's green. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:strokeColor="#1ED760"
+        android:strokeWidth="4"
+        android:pathData="M32,38h44a4,4 0,0 1,4 4v28a4,4 0,0 1,-4 4h-44a4,4 0,0 1,-4 -4v-28a4,4 0,0 1,4 -4z" />
+    <path
+        android:fillColor="#1ED760"
+        android:pathData="M58,44v15.5a5,5 0,1 0,3 4.5v-12h7v-8z" />
+</vector>
