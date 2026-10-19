@@ -625,14 +625,21 @@ static void reconnectLastPhone() {
   free(list);
 }
 
+static bool btFailed(const char *step, esp_err_t err) {
+  Serial.printf("bt: %s failed: %s\n", step, esp_err_to_name(err));
+  return false;
+}
+
 static bool startBluetooth() {
   // Classic Bluetooth only: the memory BLE would take is handed back.
   esp_bt_controller_mem_release(ESP_BT_MODE_BLE);
   esp_bt_controller_config_t cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
-  if (esp_bt_controller_init(&cfg) != ESP_OK || esp_bt_controller_enable(ESP_BT_MODE_CLASSIC_BT) != ESP_OK ||
-      esp_bluedroid_init() != ESP_OK || esp_bluedroid_enable() != ESP_OK) {
-    return false;
-  }
+  cfg.mode = ESP_BT_MODE_CLASSIC_BT;  // the default is both, and it must match the enable below
+  esp_err_t err;
+  if ((err = esp_bt_controller_init(&cfg)) != ESP_OK) return btFailed("controller init", err);
+  if ((err = esp_bt_controller_enable(ESP_BT_MODE_CLASSIC_BT)) != ESP_OK) return btFailed("controller enable", err);
+  if ((err = esp_bluedroid_init()) != ESP_OK) return btFailed("bluedroid init", err);
+  if ((err = esp_bluedroid_enable()) != ESP_OK) return btFailed("bluedroid enable", err);
   esp_bt_gap_set_device_name(BT_NAME);
   esp_bt_gap_register_callback(gapEvent);
 
@@ -658,7 +665,10 @@ static bool startBluetooth() {
   cod.minor = 0x05;  // loudspeaker
   esp_bt_gap_set_cod(cod, ESP_BT_SET_COD_MAJOR_MINOR);
 
-  esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
+  err = esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
+  const uint8_t *a = esp_bt_dev_get_address();
+  Serial.printf("bt: \"%s\" %02X:%02X:%02X:%02X:%02X:%02X, %s\n", BT_NAME, a[0], a[1], a[2], a[3], a[4], a[5],
+                err == ESP_OK ? "visible for pairing" : esp_err_to_name(err));
   reconnectLastPhone();
   return true;
 }
