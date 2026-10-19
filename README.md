@@ -124,6 +124,44 @@ the stored Wi-Fi password and Spotify sign-in back out of it, so treat it like a
 
 **Going back** to the computer version: flash `-e cyd` (or `-e cyd2usb`) again.
 
+## Bluetooth: no Wi-Fi, no computer (experimental)
+
+With this firmware your phone pairs with the CYD as a Bluetooth speaker. The CYD then shows
+the song title, artist, album and progress, plus the album cover when the phone sends one. Touch
+buttons cover previous, play/pause, next and volume down/up. It works with any app that plays
+on the phone (Spotify, YouTube Music, podcasts...), with no Wi-Fi, no Spotify account and no
+computer. USB only powers it.
+
+Phones only send song details to the Bluetooth device they are playing to, so **the sound comes
+out of the CYD**: plug a small speaker (8 ohm, up to about 1 W, JST 1.25 mm 2-pin) into the
+socket marked SPEAK. The sound is 8-bit mono, so treat it as a preview speaker, not a hi-fi.
+While the phone plays to the CYD it can't play to other Bluetooth headphones at the same time.
+
+**B1. Flash it:**
+
+```bash
+.venv/bin/pio run -d firmware -e bluetooth -t upload
+```
+
+Use `-e bluetooth2usb` for the two-port board. The first build downloads a newer ESP32
+toolchain (Arduino core 3), which takes a few minutes. If later builds then fail with
+`No module named 'intelhex'`, run `.venv/bin/pip install intelhex`.
+
+**B2. Pair:** the screen says "Pair your phone with CYD Player". Pick it in your phone's
+Bluetooth settings. After that it reconnects whenever the phone is nearby, and on power-up the
+CYD calls the last phone itself.
+
+- **Volume**: the CYD's buttons and the phone's volume buttons move the same setting (Bluetooth
+  absolute volume), shown under the progress bar. Hold a volume button to keep changing it.
+- **Album covers** need AVRCP 1.6 cover art. iPhones send them. On Android, if you only see a
+  music-note tile, turn on Developer options, set *Bluetooth AVRCP version* to **1.6**, then
+  turn Bluetooth off and on. Some apps send no cover at all; the title still shows.
+- **Unpairing**: hidden from new phones while one is connected. To forget every paired phone,
+  open `.venv/bin/pio device monitor -d firmware -e bluetooth` and type `FORGET`.
+- Titles in non-Latin scripts show as `?`, as in the Wi-Fi version.
+
+**Going back**: flash `-e cyd`, `-e standalone` (or their `2usb` versions) again.
+
 ## Troubleshooting
 
 - **Touches land off-target**: adjust the `TOUCH_*_MIN/MAX` values in `firmware/src/main.cpp`.
@@ -131,5 +169,7 @@ the stored Wi-Fi password and Spotify sign-in back out of it, so treat it like a
 - **Frames get lost**: set `LINK_BAUD` in `firmware/platformio.ini` to `921600`, reflash, and
   pass `--baud 921600`.
 - **Seeing touches**: run with `CYD_DEBUG=1` to print each touch and the button it hit.
+- **Bluetooth version misbehaving**: `.venv/bin/pio device monitor -d firmware -e bluetooth`
+  shows its log (connections, sample rate, whether the phone offers covers).
 - **Standalone version misbehaving**: `.venv/bin/pio device monitor -d firmware -e standalone` shows
   its log (Wi-Fi, Spotify errors). Close it before running the setup.

@@ -1,3 +1,5 @@
 .venv/
 .pio/
 __pycache__/
+# written by the Arduino core 3 build
+firmware/src/idf_component.yml
