@@ -1,7 +1,13 @@
 // ESP32-2432S028 (CYD) as a Bluetooth now-playing screen. No Wi-Fi and no computer: a phone
 // pairs with it like a Bluetooth speaker, and it shows what's playing (title, artist, album,
 // progress, and the cover when the phone sends one) with touch buttons for previous,
-// play/pause, next and volume. The sound comes out of the board's speaker socket.
+// play/pause, next and volume. The sound comes out of the board's speaker socket, or of an
+// I2S DAC board in the bluetooth-i2s build.
+//
+// Holding a finger on the cover or title for a second turns the sound here off (remembered
+// across restarts), for a phone that plays to two devices at once (Samsung "Dual audio"):
+// the CYD stays the phone's speaker for the song details and controls, and another speaker
+// plays. The volume buttons then ask the phone to change its volume instead.
 //
 // Bluetooth roles (Classic Bluetooth, so phones see it as an ordinary speaker):
 //   A2DP sink        receives the audio
@@ -12,7 +18,8 @@
 // rather than a remote. Covers need AVRCP 1.6 on the phone (iPhone, recent Android; on Android
 // it may need "Bluetooth AVRCP version: 1.6" in Developer options).
 //
-// Serial (SETUP_BAUD): a log, plus "FORGET" to unpair every phone.
+// Serial (SETUP_BAUD): a log, plus "FORGET" to unpair every phone. In the I2S build the log
+// is silent if the DAC's data line uses TX (GPIO1), but FORGET still works.
 //
 // Bluetooth callbacks run in the Bluetooth task; the Arduino loop draws and reads the
 // touchscreen. They share `player` under `lock`.
@@ -21,9 +28,14 @@
 #include <JPEGDEC.h>
 #include <SPI.h>
 #include <TFT_eSPI.h>
+#include <Preferences.h>
 #include <XPT2046_Touchscreen.h>
 
+#if AUDIO_I2S
+#include "driver/i2s_std.h"
+#else
 #include "driver/dac_continuous.h"
+#endif
 #include "esp_a2dp_api.h"
 #include "esp_avrc_api.h"
 #include "esp_bt.h"
@@ -37,6 +49,20 @@
 #endif
 #ifndef BT_NAME
 #define BT_NAME "CYD Player"
+#endif
+
+// I2S DAC board (PCM5102 and similar). BCK and WS are on the CN1 connector (which also has
+// 3.3 V and GND for the board), DOUT on TX of the P1 serial connector.
+#if AUDIO_I2S
+#ifndef I2S_BCK
+#define I2S_BCK 27
+#endif
+#ifndef I2S_WS
+#define I2S_WS 22
+#endif
+#ifndef I2S_DOUT
+#define I2S_DOUT 1
+#endif
 #endif
 
 // The touch controller sits on its own SPI bus on this board.
@@ -105,19 +131,83 @@ static void setNotice(const String &s) {
   Serial.println(s);
 }
 
-// --- audio out: A2DP -> ring buffer -> DAC on GPIO26 (the speaker socket's amplifier) ---
+// --- audio out ---
+//
+// A2DP -> ring buffer -> audio task -> either the DAC on GPIO26 (8-bit mono into the speaker
+// socket's amplifier) or an I2S DAC board (16-bit stereo).
 
 static RingbufHandle_t audioRing;
-static dac_continuous_handle_t dac;
 static uint32_t sampleRate = 44100;
 static volatile bool rateChanged = false;
+static volatile bool muted = false;  // the sound plays elsewhere (see the top of this file)
+static Preferences prefs;
 
 // Phones send audio at full scale once the speaker handles volume itself (absolute volume),
 // so it is applied here. Squared, as loudness is heard roughly logarithmically.
 static uint32_t gain() { return (uint32_t)volume * volume; }  // out of 127 * 127
 
+#if AUDIO_I2S
+
+static const size_t RING_BYTES = 32 * 1024;  // about 185 ms of 16-bit stereo
+static i2s_chan_handle_t i2sTx;
+
+// Bluetooth task: 16-bit stereo in and out, scaled by the volume, never blocking.
+static void audioData(const uint8_t *data, uint32_t len) {
+  if (muted) return;
+  static int16_t out[512];
+  const int16_t *pcm = (const int16_t *)data;
+  uint32_t samples = len / 2, g = gain();
+  while (samples) {
+    uint32_t n = min<uint32_t>(samples, 512);
+    for (uint32_t i = 0; i < n; i++) out[i] = (int32_t)pcm[i] * (int32_t)g / (127 * 127);
+    xRingbufferSend(audioRing, out, n * 2, 0);  // full: drop rather than hold up Bluetooth
+    pcm += n;
+    samples -= n;
+  }
+}
+
+static bool startAudio() {
+  i2s_chan_config_t chan = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+  chan.auto_clear_after_cb = true;  // silence, not old buffers, when nothing is waiting
+  i2s_std_config_t std = {
+      .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(sampleRate),
+      .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
+      .gpio_cfg = {
+          .mclk = I2S_GPIO_UNUSED,  // PCM5102 boards make their own clock (SCK tied to GND)
+          .bclk = (gpio_num_t)I2S_BCK,
+          .ws = (gpio_num_t)I2S_WS,
+          .dout = (gpio_num_t)I2S_DOUT,
+          .din = I2S_GPIO_UNUSED,
+          .invert_flags = {},
+      },
+  };
+  std.clk_cfg.clk_src = I2S_CLK_SRC_APLL;  // the default clock can't hit 44.1 kHz closely
+  if (i2s_new_channel(&chan, &i2sTx, nullptr) != ESP_OK) return false;
+  if (i2s_channel_init_std_mode(i2sTx, &std) != ESP_OK || i2s_channel_enable(i2sTx) != ESP_OK) {
+    i2s_del_channel(i2sTx);
+    return false;
+  }
+  return true;
+}
+
+static void stopAudio() {
+  i2s_channel_disable(i2sTx);
+  i2s_del_channel(i2sTx);
+}
+
+static void writeAudio(const uint8_t *buf, size_t n) {
+  if (buf) i2s_channel_write(i2sTx, buf, n, nullptr, portMAX_DELAY);
+  else delay(5);  // the DMA plays silence by itself
+}
+
+#else
+
+static const size_t RING_BYTES = 16 * 1024;  // about 370 ms of 8-bit mono
+static dac_continuous_handle_t dac;
+
 // Bluetooth task: 16-bit stereo in, 8-bit mono out, never blocking.
 static void audioData(const uint8_t *data, uint32_t len) {
+  if (muted) return;
   static uint8_t out[1024];
   const int16_t *pcm = (const int16_t *)data;
   uint32_t frames = len / 4, g = gain();
@@ -134,7 +224,7 @@ static void audioData(const uint8_t *data, uint32_t len) {
   }
 }
 
-static void startDac() {
+static bool startAudio() {
   dac_continuous_config_t cfg = {
       .chan_mask = DAC_CHANNEL_MASK_CH1,  // GPIO26
       .desc_num = 4,
@@ -144,35 +234,60 @@ static void startDac() {
       .clk_src = DAC_DIGI_CLK_SRC_APLL,  // the default clock can't hit 44.1 kHz closely
       .chan_mode = DAC_CHANNEL_MODE_SIMUL,
   };
-  if (dac_continuous_new_channels(&cfg, &dac) != ESP_OK || dac_continuous_enable(dac) != ESP_OK) {
-    Serial.println("audio: DAC start failed");
-    dac = nullptr;
+  if (dac_continuous_new_channels(&cfg, &dac) != ESP_OK) return false;
+  if (dac_continuous_enable(dac) != ESP_OK) {
+    dac_continuous_del_channels(dac);
+    return false;
   }
+  return true;
 }
 
-static void audioTask(void *) {
+static void stopAudio() {
+  dac_continuous_disable(dac);
+  dac_continuous_del_channels(dac);
+}
+
+// Silence (mid-scale) whenever no audio is waiting: the DMA would otherwise replay old
+// buffers as a buzz. Writing blocks until the DAC has room, so the audio task paces itself.
+static void writeAudio(const uint8_t *buf, size_t n) {
   static uint8_t silence[256];
-  memset(silence, 128, sizeof(silence));
-  startDac();
+  if (!buf) {
+    memset(silence, 128, sizeof(silence));
+    buf = silence;
+    n = sizeof(silence);
+  }
+  dac_continuous_write(dac, (uint8_t *)buf, n, nullptr, -1);
+}
+
+#endif
+
+static void audioTask(void *) {
+  bool running = startAudio();
+  if (!running) Serial.println("audio: output failed to start");
   for (;;) {
     if (rateChanged) {
       rateChanged = false;
-      if (dac) {
-        dac_continuous_disable(dac);
-        dac_continuous_del_channels(dac);
-      }
-      startDac();
+      if (running) stopAudio();
+      running = startAudio();
     }
-    size_t n = 0;
-    uint8_t *buf = (uint8_t *)xRingbufferReceiveUpTo(audioRing, &n, 0, 512);
-    if (!dac) {
-      if (buf) vRingbufferReturnItem(audioRing, buf);
+    if (!running) {
+      delay(100);
       continue;
     }
-    // Silence (mid-scale) whenever no audio is waiting: the DMA would otherwise replay old
-    // buffers as a buzz. Writing blocks until the DAC has room, so this loop paces itself.
-    dac_continuous_write(dac, buf ? buf : silence, buf ? n : sizeof(silence), nullptr, -1);
+    size_t n = 0;
+    uint8_t *buf = (uint8_t *)xRingbufferReceiveUpTo(audioRing, &n, 0, 1024);
+    writeAudio(buf, n);
     if (buf) vRingbufferReturnItem(audioRing, buf);
+  }
+}
+
+static void setMuted(bool m) {
+  muted = m;
+  prefs.putBool("muted", m);
+  if (m) {  // empty what is already queued, so it stops at once
+    size_t n;
+    void *item;
+    while ((item = xRingbufferReceiveUpTo(audioRing, &n, 0, RING_BYTES))) vRingbufferReturnItem(audioRing, item);
   }
 }
 
@@ -422,8 +537,13 @@ static void avrcTgEvent(esp_avrc_tg_cb_event_t event, esp_avrc_tg_cb_param_t *p)
   }
 }
 
-// Volume buttons: change it here and tell the phone, whose slider then follows.
+// Volume buttons: change it here and tell the phone, whose slider then follows. With the
+// sound off here they ask the phone to change its own volume (some phones ignore this).
 static void stepVolume(int delta) {
+  if (muted) {
+    sendKey(delta > 0 ? ESP_AVRC_PT_CMD_VOL_UP : ESP_AVRC_PT_CMD_VOL_DOWN);
+    return;
+  }
   xSemaphoreTake(lock, portMAX_DELAY);
   volume = constrain((int)volume + delta, 0, 127);
   bump();
@@ -701,8 +821,8 @@ static String clockText(uint32_t ms) {
   return buf;
 }
 
-// The progress bar, with the volume in the middle of the line below it.
-static void drawProgress(uint32_t pos, uint32_t len, uint8_t vol) {
+// The progress bar, with the volume (or "Sound off") in the middle of the line below it.
+static void drawProgress(uint32_t pos, uint32_t len, uint8_t vol, bool mute) {
   tft.fillRect(0, BAR_Y, W, 26, BG);
   tft.fillRoundRect(12, BAR_Y, W - 24, 6, 2, TRACK);
   tft.setTextFont(2);
@@ -716,7 +836,7 @@ static void drawProgress(uint32_t pos, uint32_t len, uint8_t vol) {
     tft.drawString(clockText(len), W - 12, BAR_Y + 9);
   }
   tft.setTextDatum(TC_DATUM);
-  tft.drawString(String("Volume ") + (vol * 100 + 63) / 127 + "%", W / 2, BAR_Y + 9);
+  tft.drawString(mute ? String("Sound off") : String("Volume ") + (vol * 100 + 63) / 127 + "%", W / 2, BAR_Y + 9);
   tft.setTextDatum(TL_DATUM);
 }
 
@@ -758,6 +878,8 @@ static void drawButton(int b, const Player &p, bool pressed) {
 
 static uint8_t pressedButton = B_NONE;
 static uint32_t pressedSince = 0, lastRepeat = 0;
+static uint32_t holdSince = 0;  // finger on the cover or title, for the sound on/off hold
+static bool holdDone = false;   // toggled already during this touch
 
 static uint8_t buttonAt(int x, int y) {
   if (y < BTN_Y0 - 8) return B_NONE;
@@ -798,7 +920,14 @@ static void pollTouch() {
     TS_Point pt = touch.getPoint();
     int x = constrain(map(pt.x, TOUCH_X_MIN, TOUCH_X_MAX, 0, W - 1), 0, W - 1);
     int y = constrain(map(pt.y, TOUCH_Y_MIN, TOUCH_Y_MAX, 0, H - 1), 0, H - 1);
-    if (pressedButton == B_NONE) {
+    if (pressedButton == B_NONE && buttonAt(x, y) == B_NONE) {
+      if (!holdSince) holdSince = millis();
+      if (!holdDone && millis() - holdSince > 1000) {
+        holdDone = true;
+        setMuted(!muted);
+        setNotice(muted ? "Sound off here" : "Sound on");
+      }
+    } else if (pressedButton == B_NONE) {
       pressedButton = buttonAt(x, y);
       pressedSince = lastRepeat = millis();
       if (pressedButton != B_NONE) {
@@ -811,7 +940,11 @@ static void pollTouch() {
       lastRepeat = millis();  // holding a volume button keeps stepping
       stepVolume(pressedButton == B_VOL_UP ? VOL_STEP / 2 : -VOL_STEP / 2);
     }
-  } else if (pressedButton != B_NONE) {
+  } else if (holdSince) {
+    holdSince = 0;
+    holdDone = false;
+  }
+  if (!down && pressedButton != B_NONE) {
     uint8_t b = pressedButton;
     bool held = millis() - pressedSince > 500;
     pressedButton = B_NONE;
@@ -858,7 +991,9 @@ void setup() {
   touch.setRotation(1);
 
   lock = xSemaphoreCreateMutex();
-  audioRing = xRingbufferCreate(16 * 1024, RINGBUF_TYPE_BYTEBUF);
+  prefs.begin("cyd-bluetooth");
+  muted = prefs.getBool("muted", false);
+  audioRing = xRingbufferCreate(RING_BYTES, RINGBUF_TYPE_BYTEBUF);
   xTaskCreatePinnedToCore(audioTask, "audio", 3072, nullptr, 5, nullptr, 1);
   Serial.println("CYD-BLUETOOTH READY");
   if (!startBluetooth()) {
@@ -874,6 +1009,7 @@ void loop() {
   static Player shown;
   static bool shownConnected = false, noticeShown = false;
   static uint8_t shownPressed = B_NONE, shownVolume = 255;
+  static bool shownMuted = false;
 
   readSerial();
   pollTouch();
@@ -933,10 +1069,13 @@ void loop() {
   }
   uint32_t pos = p.progressMs + (p.playing ? millis() - p.at : 0);
   if (p.durationMs) pos = min(pos, p.durationMs);
-  if (full || pos / 1000 != drawnSecond || p.durationMs != shown.durationMs || vol != shownVolume) {
+  bool mute = muted;
+  if (full || pos / 1000 != drawnSecond || p.durationMs != shown.durationMs || vol != shownVolume ||
+      mute != shownMuted) {
     drawnSecond = pos / 1000;
     shownVolume = vol;
-    drawProgress(pos, p.durationMs, vol);
+    shownMuted = mute;
+    drawProgress(pos, p.durationMs, vol, mute);
   }
   for (int b = 0; b < N_BUTTONS; b++) {
     bool changed = full || (pressedButton == b) != (shownPressed == b);

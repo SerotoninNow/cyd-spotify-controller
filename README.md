@@ -132,10 +132,29 @@ buttons cover previous, play/pause, next and volume down/up. It works with any a
 on the phone (Spotify, YouTube Music, podcasts...), with no Wi-Fi, no Spotify account and no
 computer. USB only powers it.
 
-Phones only send song details to the Bluetooth device they are playing to, so **the sound comes
-out of the CYD**: plug a small speaker (8 ohm, up to about 1 W, JST 1.25 mm 2-pin) into the
-socket marked SPEAK. The sound is 8-bit mono, so treat it as a preview speaker, not a hi-fi.
-While the phone plays to the CYD it can't play to other Bluetooth headphones at the same time.
+Phones only send song details to the Bluetooth device they are playing to, so the phone has to
+treat the CYD as its speaker. Where the sound actually goes is up to you:
+
+- **The speaker socket** (`-e bluetooth`): plug a small speaker (8 ohm, up to about 1 W,
+  JST 1.25 mm 2-pin) into the socket marked SPEAK. It is 8-bit mono, so treat it as a preview
+  speaker, not a hi-fi.
+- **An I2S DAC board** (`-e bluetooth-i2s`): proper 16-bit stereo for headphones, an amplifier
+  or powered speakers, from a PCM5102 board (a few dollars). Wire it as below.
+- **Another Bluetooth speaker, with the CYD silent**: on phones that play to two Bluetooth
+  devices at once (Samsung *Dual audio* in the media output panel), turn the CYD's sound off by
+  holding a finger on the cover or title for a second. It still shows the song and its buttons
+  still work, and the other speaker plays. Hold again to turn the sound back on; it's
+  remembered across restarts. While it's off, the volume buttons ask the phone to change its
+  volume instead, which some phones ignore (the phone's own buttons always work).
+
+Without dual audio, a phone plays to one Bluetooth device at a time, and plugging headphones into
+the phone moves the sound away from the CYD, which may then stop getting song changes.
+
+I2S wiring (CYD to PCM5102 board): the CN1 connector gives 3.3V to VIN, GND to GND,
+GPIO27 to BCK and GPIO22 to LCK (word select). The P1 serial connector gives TX to DIN.
+Tie the board's SCK pin to GND. The common purple boards also have four solder jumpers on the
+back; if they're blank (no sound at all), bridge FLT, DEMP and FMT to L and XSMT to H. Other pins: add `-DI2S_BCK=`, `-DI2S_WS=` or `-DI2S_DOUT=` to the env's
+build flags. Using TX means this build's serial log stays silent; uploading still works.
 
 **B1. Flash it:**
 
@@ -143,7 +162,8 @@ While the phone plays to the CYD it can't play to other Bluetooth headphones at 
 .venv/bin/pio run -d firmware -e bluetooth -t upload
 ```
 
-Use `-e bluetooth2usb` for the two-port board. The first build downloads a newer ESP32
+Use `-e bluetooth2usb` for the two-port board (`-e bluetooth-i2s`, `-e bluetooth-i2s-2usb` for
+I2S). The first build downloads a newer ESP32
 toolchain (Arduino core 3), which takes a few minutes. If later builds then fail with
 `No module named 'intelhex'`, run `.venv/bin/pip install intelhex`.
 
@@ -152,7 +172,8 @@ Bluetooth settings. After that it reconnects whenever the phone is nearby, and o
 CYD calls the last phone itself.
 
 - **Volume**: the CYD's buttons and the phone's volume buttons move the same setting (Bluetooth
-  absolute volume), shown under the progress bar. Hold a volume button to keep changing it.
+  absolute volume), shown under the progress bar ("Sound off" when muted). Hold a volume button
+  to keep changing it.
 - **Album covers** need AVRCP 1.6 cover art. iPhones send them. On Android, if you only see a
   music-note tile, turn on Developer options, set *Bluetooth AVRCP version* to **1.6**, then
   turn Bluetooth off and on. Some apps send no cover at all; the title still shows.
