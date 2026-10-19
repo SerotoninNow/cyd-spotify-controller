@@ -25,3 +25,7 @@ Not yet tried on real hardware. With the remote firmware from this branch flashe
 11. **Headphones**: wired/USB-C or Bluetooth headphones keep playing; the CYD keeps showing
     the song.
 12. **Odd text**: a song with accents (shown without them) and one in another script (`?`).
+13. **Share**: *Share this app* → Quick Share to another phone; it installs from My Files there.
+14. **Release APK**: uninstall the debug build, install the APK from the GitHub release (or the
+    pull request's artifact), grant access again: everything above still works (that build is
+    minified, so this is worth a quick run-through).

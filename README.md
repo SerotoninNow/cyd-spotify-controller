@@ -213,7 +213,17 @@ whether it's playing. Without the app it goes back to the big buttons.
 **A1. Flash the remote firmware** from this branch (above). Older remote builds lack the
 song-details service.
 
-**A2. Build the app.** You need JDK 17 or newer (21 recommended) and the Android SDK
+**A2. Install the app.** On the phone, open the
+[Releases page](https://github.com/SerotoninNow/cyd-spotify-controller/releases), find the
+latest *CYD Now Playing* release, and tap `CYD-Now-Playing-….apk`. When the download is done,
+open it and allow your browser to install unknown apps if asked. A newer release installs
+over the old one and keeps its settings.
+
+If you already have the app, share it with another phone: open it and tap *Share this app*,
+then pick Quick Share (or Bluetooth, or any messaging app that accepts files). On the other
+phone, open the received file in My Files to install it. It still needs step A4 there.
+
+**A3. Or build it yourself.** You need JDK 17 or newer (21 recommended) and the Android SDK
 (Android Studio installs both; or the command-line tools with `platforms;android-36`). Tell
 Gradle where the SDK is, either with `ANDROID_HOME` or a file `android/local.properties`
 containing `sdk.dir=/path/to/Android/Sdk`, then:
@@ -222,19 +232,17 @@ containing `sdk.dir=/path/to/Android/Sdk`, then:
 cd android && ./gradlew assembleDebug
 ```
 
-The APK is `android/app/build/outputs/apk/debug/app-debug.apk`. Opening the `android` folder
-in Android Studio and pressing Run works too.
-
-**A3. Install it.** The simplest way is USB debugging (Settings > About phone > Software
-information, tap *Build number* seven times; then Developer options > *USB debugging*), plug
-the phone in and run:
+Install `android/app/build/outputs/apk/debug/app-debug.apk` with USB debugging on
+(Settings > About phone > Software information, tap *Build number* seven times; then
+Developer options > *USB debugging*):
 
 ```bash
 adb install -r android/app/build/outputs/apk/debug/app-debug.apk
 ```
 
-Or copy the APK to the phone and open it in My Files, allowing My Files to install unknown
-apps when asked.
+A build you make yourself is signed with your computer's own debug key, so the phone won't
+install a release over it, or the other way round: uninstall the app first when switching
+(you'll have to grant access again).
 
 **A4. Grant access.** Open **CYD Now Playing** on the phone:
 
@@ -260,6 +268,13 @@ Background usage limits).
   remembers the old one. Flash it again, then forget CYD Remote in Bluetooth settings and pair
   again.
 - Titles in non-Latin scripts show as `?`, as in the other versions.
+
+**Publishing a new version** (for the repository owner): push a tag such as `app-v1.1`, and
+the *Android app* workflow builds a signed APK and attaches it to a new release. It signs with
+the key in the repository secrets `KEYSTORE_BASE64` and `KEYSTORE_PASSWORD`; the same key is in
+`~/.config/cyd-now-playing/` on the computer that created it, and local release builds
+(`./gradlew assembleRelease`) use it from there. Keep a backup of that folder: if the key is
+lost, phones can't update to a release signed with a new one without uninstalling first.
 
 ## Troubleshooting
 

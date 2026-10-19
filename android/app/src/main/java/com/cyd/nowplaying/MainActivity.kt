@@ -3,6 +3,7 @@ package com.cyd.nowplaying
 import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Activity
+import android.content.ClipData
 import android.content.ComponentName
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -74,6 +75,10 @@ class MainActivity : Activity() {
         column.addView(statusText)
         playingText = text("", 15f)
         column.addView(playingText)
+
+        column.addView(heading("Share"))
+        column.addView(text("Send this app to another phone, by Quick Share or any other way of sending files.", 15f))
+        column.addView(button("Share this app") { shareApp() })
     }
 
     override fun onResume() {
@@ -158,6 +163,16 @@ class MainActivity : Activity() {
         } catch (e: Exception) {
             startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
         }
+    }
+
+    private fun shareApp() {
+        val uri = ApkProvider.uri(packageName)
+        val send = Intent(Intent.ACTION_SEND)
+            .setType(ApkProvider.MIME)
+            .putExtra(Intent.EXTRA_STREAM, uri)
+            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        send.clipData = ClipData.newRawUri(ApkProvider.NAME, uri)  // carries the permission through the chooser
+        startActivity(Intent.createChooser(send, "Share CYD Now Playing"))
     }
 
     // --- views ---
