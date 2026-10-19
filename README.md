@@ -217,7 +217,8 @@ song-details service.
 [Releases page](https://github.com/SerotoninNow/cyd-spotify-controller/releases), find the
 latest *CYD Now Playing* release, and tap `CYD-Now-Playing-….apk`. When the download is done,
 open it and allow your browser to install unknown apps if asked. A newer release installs
-over the old one and keeps its settings.
+over the old one and keeps its settings. What changed in each version is in
+[android/CHANGELOG.md](android/CHANGELOG.md).
 
 If you already have the app, share it with another phone: open it and tap *Share this app*,
 then pick Quick Share (or Bluetooth, or any messaging app that accepts files). On the other
