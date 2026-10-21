@@ -90,6 +90,11 @@ class MediaListener : NotificationListenerService() {
         AppState.setNowPlaying(describe())
     }
 
+    // The CYD may be paired after the listener started, when there was none to pick yet.
+    fun reconnectIfNoDevice() {
+        if (running && !link.hasDevice) reconnect()
+    }
+
     private val sessionsChanged = MediaSessionManager.OnActiveSessionsChangedListener { list ->
         follow(list ?: emptyList())
     }
@@ -114,8 +119,10 @@ class MediaListener : NotificationListenerService() {
     }
 
     // While playing, the CYD's clock drifts from the player's: line them up now and then.
+    // Also picks up a CYD paired since the last look.
     private val resync = object : Runnable {
         override fun run() {
+            reconnectIfNoDevice()
             if (current?.playbackState?.state == PlaybackState.STATE_PLAYING) update()
             handler.postDelayed(this, 15_000)
         }

@@ -4,6 +4,16 @@ Each version is a tag (`app-v…`) with a signed APK on the
 [Releases page](https://github.com/SerotoninNow/cyd-spotify-controller/releases). All releases
 are signed with the same key, so each installs over the one before.
 
+## 1.0.2 (2026-10-20)
+
+- Fixed: with the CYD paired after the app had started, the status stayed at "No CYD chosen"
+  and nothing was sent, even though CYD Remote showed as picked (tapping it did nothing, as it
+  was already ticked). The app now looks for the CYD again whenever it's opened, and every
+  15 seconds in the background, until it has one.
+- First run on real hardware (Galaxy S22, Android 16): song details, covers and updates arrive. If the
+  CYD shows the first song and then never changes, check the app is 1.0.1 or later: 1.0
+  crashes as soon as it sends a cover.
+
 ## 1.0.1 (2026-10-19)
 
 - Fixed: the app crashed on every start once it began sending a cover to the CYD, so it

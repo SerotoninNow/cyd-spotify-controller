@@ -96,6 +96,7 @@ class MainActivity : Activity() {
         val bt = hasBluetoothPermission()
         bluetoothText.text = if (bt) "Allowed." else "Needed to talk to the CYD."
         bluetoothButton.visibility = if (bt) View.GONE else View.VISIBLE
+        MediaListener.instance?.reconnectIfNoDevice()  // e.g. back from pairing in Bluetooth settings
         showDevices()
         showStatus()
     }

@@ -42,6 +42,7 @@ class CydLink(
     private val coverQueue = ArrayDeque<ByteArray>()
 
     val ready get() = characteristic != null
+    val hasDevice get() = address != null
 
     fun hasPermission() =
         Build.VERSION.SDK_INT < 31 ||
