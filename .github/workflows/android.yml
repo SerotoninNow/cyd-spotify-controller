@@ -10,7 +10,7 @@ on:
   push:
     tags: ["app-v*"]
   pull_request:
-    paths: ["android/**", ".github/workflows/android.yml"]
+    paths: ["android/**", "firmware/**", ".github/workflows/android.yml"]
   workflow_dispatch:
 
 permissions:
@@ -24,6 +24,8 @@ jobs:
         working-directory: android
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0  # the firmware's id is the last commit that changed firmware/
 
       - uses: actions/setup-java@v5
         with:
@@ -31,6 +33,21 @@ jobs:
           java-version: 21
 
       - uses: gradle/actions/setup-gradle@v5
+
+      # The CYD firmware goes inside the app, which can then update the CYD over Bluetooth.
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: platformio-${{ hashFiles('firmware/platformio.ini') }}
+
+      - name: Firmware
+        run: |
+          pip install platformio
+          ./bundle-firmware.sh
 
       - name: Signing key
         env:

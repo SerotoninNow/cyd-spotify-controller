@@ -3,6 +3,7 @@ package com.cyd.nowplaying
 import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Activity
+import android.app.AlertDialog
 import android.content.ClipData
 import android.content.ComponentName
 import android.content.Intent
@@ -30,6 +31,10 @@ class MainActivity : Activity() {
     private lateinit var devices: RadioGroup
     private lateinit var statusText: TextView
     private lateinit var playingText: TextView
+    private lateinit var firmwareText: TextView
+    private lateinit var updateText: TextView
+    private lateinit var updateButton: Button
+    private var bundled: Firmware.Bundled? = null
     private val refresh: () -> Unit = { showStatus() }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -76,6 +81,15 @@ class MainActivity : Activity() {
         playingText = text("", 15f)
         column.addView(playingText)
 
+        bundled = Firmware.bundled(this)
+        column.addView(heading("CYD firmware"))
+        firmwareText = text("", 15f)
+        column.addView(firmwareText)
+        updateButton = button("Update the CYD") { confirmUpdate() }
+        column.addView(updateButton)
+        updateText = text("", 15f)
+        column.addView(updateText)
+
         column.addView(heading("Share"))
         column.addView(text("Send this app to another phone, by Quick Share or any other way of sending files.", 15f))
         column.addView(button("Share this app") { shareApp() })
@@ -119,6 +133,29 @@ class MainActivity : Activity() {
             else -> AppState.status
         }
         playingText.text = if (MediaListener.instance != null) "Playing: ${AppState.nowPlaying}" else ""
+
+        val check = Firmware.check(bundled, AppState.cydFirmware)
+        firmwareText.text = check.text
+        updateButton.text = if (check.offer == Firmware.Offer.REPLACE_FLAVOR) "Replace the CYD's firmware" else "Update the CYD"
+        updateButton.visibility = if (check.offer != Firmware.Offer.NONE && !AppState.updating) View.VISIBLE else View.GONE
+        updateText.text = AppState.update
+        updateText.visibility = if (AppState.update.isEmpty()) View.GONE else View.VISIBLE
+    }
+
+    private fun confirmUpdate() {
+        val check = Firmware.check(bundled, AppState.cydFirmware)
+        if (check.offer != Firmware.Offer.REPLACE_FLAVOR) return startUpdate()
+        AlertDialog.Builder(this)
+            .setTitle("Replace the CYD's firmware?")
+            .setMessage(check.text)
+            .setPositiveButton("Replace") { _, _ -> startUpdate() }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun startUpdate() {
+        val why = MediaListener.instance?.updateFirmware() ?: return
+        AppState.setUpdate(why, false)
     }
 
     @SuppressLint("MissingPermission")  // pairedDevices() is empty without the permission

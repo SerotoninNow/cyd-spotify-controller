@@ -30,6 +30,28 @@ object AppState {
         main.post { listeners.toList().forEach { it() } }
     }
 
+    // What the connected CYD says it runs (see Firmware.check); null while not connected.
+    var cydFirmware: Map<String, String>? = null
+        private set
+
+    fun setCydFirmware(info: Map<String, String>?) {
+        if (info == cydFirmware) return
+        cydFirmware = info
+        main.post { listeners.toList().forEach { it() } }
+    }
+
+    // A firmware update's progress, or how the last one ended; "" if there's been none.
+    var update = ""
+        private set
+    var updating = false
+        private set
+
+    fun setUpdate(text: String, running: Boolean) {
+        update = text
+        updating = running
+        main.post { listeners.toList().forEach { it() } }
+    }
+
     private fun prefs(c: Context) = c.getSharedPreferences("cyd", Context.MODE_PRIVATE)
 
     @SuppressLint("MissingPermission")  // callers check for BLUETOOTH_CONNECT

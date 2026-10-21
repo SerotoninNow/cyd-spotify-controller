@@ -16,12 +16,23 @@
 //   0x02 cover   id (u32), JPEG length (u32, 0: no cover)
 //   0x03 piece   id (u32), offset (u32), JPEG bytes; the cover shows once all have arrived
 //
+// Firmware info: a readable characteristic, "id=<FW_ID>;flavor=<FW_FLAVOR>;board=<FW_BOARD>".
+//
+// Firmware update: a characteristic only a paired (encrypted) link can write, with packets
+// like the now-playing ones; the CYD answers each step in a notification on it.
+//   0x10 begin   size (u32), SHA-256 of the image (32 bytes)      -> "ready" or "err:<why>"
+//   0x11 data    offset (u32), image bytes, in order
+//   0x12 end     checks the SHA-256 and the image                 -> "done" (then restarts)
+//                                                                     or "err:<why>"
+// A problem part-way also sends "err:<why>"; the running firmware stays until "done".
+//
 // Serial (SETUP_BAUD): a log.
 //
 // Bluetooth callbacks run in the Bluetooth task; the Arduino loop draws and reads the
 // touchscreen. They share `song` and the finished cover under `lock`.
 
 #include <Arduino.h>
+#include <BLE2902.h>
 #include <BLEDevice.h>
 #include <BLEHIDDevice.h>
 #include <BLESecurity.h>
@@ -30,6 +41,8 @@
 #include <SPI.h>
 #include <TFT_eSPI.h>
 #include <XPT2046_Touchscreen.h>
+#include <esp_ota_ops.h>
+#include <mbedtls/sha256.h>
 
 #ifndef SETUP_BAUD
 #define SETUP_BAUD 115200
@@ -37,10 +50,22 @@
 #ifndef BT_NAME
 #define BT_NAME "CYD Remote"
 #endif
+// Set by fw_info.py.
+#ifndef FW_ID
+#define FW_ID "unknown"
+#endif
+#ifndef FW_FLAVOR
+#define FW_FLAVOR "public"
+#endif
+#ifndef FW_BOARD
+#define FW_BOARD "unknown"
+#endif
 
 // Must match android/app/src/main/java/com/cyd/nowplaying/Protocol.kt.
 #define NOW_PLAYING_SERVICE "8d5f0001-3c4b-4f1e-9a57-6b1c2d0e7a10"
 #define NOW_PLAYING_CHAR "8d5f0002-3c4b-4f1e-9a57-6b1c2d0e7a10"
+#define FIRMWARE_INFO_CHAR "8d5f0003-3c4b-4f1e-9a57-6b1c2d0e7a10"
+#define FIRMWARE_UPDATE_CHAR "8d5f0004-3c4b-4f1e-9a57-6b1c2d0e7a10"
 
 // The touch controller sits on its own SPI bus on this board.
 #define TOUCH_IRQ 36
@@ -127,6 +152,9 @@ static BLECharacteristic *input;
 static volatile bool connected = false;
 static String notice;  // shown briefly in the status line (loop only)
 static uint32_t noticeUntil = 0;
+static BLECharacteristic *updateChar;
+static volatile int8_t updatePercent = -1;  // a firmware update's progress; -1: none running
+static volatile bool updateDone = false;    // installed: the loop restarts into it
 
 static void bump() {
   xSemaphoreTake(lock, portMAX_DELAY);
@@ -233,6 +261,108 @@ class NowPlayingWrites : public BLECharacteristicCallbacks {
   }
 };
 
+// --- firmware update (Bluetooth task) ---
+
+static esp_ota_handle_t otaHandle = 0;  // 0: no update running
+static const esp_partition_t *otaPartition = nullptr;
+static size_t otaSize = 0, otaGot = 0;
+static uint8_t otaSha[32];
+static mbedtls_sha256_context otaShaCtx;
+
+static void updateReply(const char *msg) {
+  updateChar->setValue((uint8_t *)msg, strlen(msg));
+  updateChar->notify();
+  Serial.printf("update: %s\n", msg);
+}
+
+// Drops a part-written update; the running firmware stays.
+static void updateStop() {
+  if (otaHandle) {
+    esp_ota_abort(otaHandle);
+    mbedtls_sha256_free(&otaShaCtx);
+    otaHandle = 0;
+  }
+  updatePercent = -1;
+  bump();
+}
+
+static void updateFail(const char *why) {
+  char msg[80];
+  snprintf(msg, sizeof(msg), "err:%s", why);
+  updateReply(msg);
+  updateStop();
+}
+
+static void onUpdateBegin(const uint8_t *d, size_t n) {
+  updateStop();  // a new begin replaces an unfinished update
+  if (n < 37) return updateFail("bad begin");
+  otaSize = readU32(d + 1);
+  memcpy(otaSha, d + 5, 32);
+  otaPartition = esp_ota_get_next_update_partition(nullptr);
+  if (!otaPartition) return updateFail("no room for an update: flash this firmware over USB once");
+  if (otaSize == 0 || otaSize > otaPartition->size) return updateFail("image too big");
+  // Sequential writes erase as they go: erasing the whole slot first would hold up Bluetooth.
+  esp_err_t e = esp_ota_begin(otaPartition, OTA_WITH_SEQUENTIAL_WRITES, &otaHandle);
+  if (e != ESP_OK) {
+    otaHandle = 0;
+    return updateFail(esp_err_to_name(e));
+  }
+  mbedtls_sha256_init(&otaShaCtx);
+  mbedtls_sha256_starts(&otaShaCtx, 0);
+  otaGot = 0;
+  updatePercent = 0;
+  bump();
+  updateReply("ready");
+}
+
+static void onUpdateData(const uint8_t *d, size_t n) {
+  if (!otaHandle) return;  // after an error the rest of the image is ignored
+  if (n < 5) return updateFail("bad data");
+  size_t offset = readU32(d + 1), len = n - 5;
+  if (offset != otaGot || otaGot + len > otaSize) return updateFail("pieces out of order");
+  if (offset == 0 && (len == 0 || d[5] != 0xE9)) return updateFail("not a firmware image");
+  esp_err_t e = esp_ota_write(otaHandle, d + 5, len);
+  if (e != ESP_OK) return updateFail(esp_err_to_name(e));
+  mbedtls_sha256_update(&otaShaCtx, d + 5, len);
+  otaGot += len;
+  int8_t percent = otaGot * 100 / otaSize;
+  if (percent != updatePercent) {
+    updatePercent = percent;
+    bump();
+  }
+}
+
+static void onUpdateEnd() {
+  if (!otaHandle) return;
+  if (otaGot != otaSize) return updateFail("image incomplete");
+  uint8_t sha[32];
+  mbedtls_sha256_finish(&otaShaCtx, sha);
+  if (memcmp(sha, otaSha, sizeof(sha))) return updateFail("checksum doesn't match");
+  esp_ota_handle_t h = otaHandle;
+  otaHandle = 0;
+  mbedtls_sha256_free(&otaShaCtx);
+  esp_err_t e = esp_ota_end(h);  // checks the image too; frees `h` either way
+  if (e == ESP_OK) e = esp_ota_set_boot_partition(otaPartition);
+  if (e != ESP_OK) return updateFail(esp_err_to_name(e));
+  updateDone = true;
+  bump();
+  updateReply("done");
+}
+
+class UpdateWrites : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *c) override {
+    String v = c->getValue();
+    const uint8_t *d = (const uint8_t *)v.c_str();
+    size_t n = v.length();
+    if (!n) return;
+    switch (d[0]) {
+      case 0x10: onUpdateBegin(d, n); break;
+      case 0x11: onUpdateData(d, n); break;
+      case 0x12: onUpdateEnd(); break;
+    }
+  }
+};
+
 // --- Bluetooth ---
 
 class ServerEvents : public BLEServerCallbacks {
@@ -243,6 +373,10 @@ class ServerEvents : public BLEServerCallbacks {
   }
   void onDisconnect(BLEServer *) override {
     connected = false;
+    if (otaHandle) {
+      Serial.println("update: link lost, dropped");
+      updateStop();
+    }
     dropArt();
     showNoArt();
     xSemaphoreTake(lock, portMAX_DELAY);
@@ -290,6 +424,13 @@ static void startBle() {
   BLECharacteristic *npChar = np->createCharacteristic(
       NOW_PLAYING_CHAR, BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR);
   npChar->setCallbacks(new NowPlayingWrites());
+  BLECharacteristic *info = np->createCharacteristic(FIRMWARE_INFO_CHAR, BLECharacteristic::PROPERTY_READ);
+  info->setValue("id=" FW_ID ";flavor=" FW_FLAVOR ";board=" FW_BOARD);
+  updateChar = np->createCharacteristic(
+      FIRMWARE_UPDATE_CHAR, BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_NOTIFY);
+  updateChar->setAccessPermissions(ESP_GATT_PERM_WRITE_ENCRYPTED);  // paired phones only
+  updateChar->addDescriptor(new BLE2902());
+  updateChar->setCallbacks(new UpdateWrites());
   np->start();
 
   BLEAdvertising *adv = BLEDevice::getAdvertising();
@@ -580,6 +721,26 @@ static void drawSmallButton(int b, bool playing, bool pressed) {
   }
 }
 
+// Firmware update: replaces the whole screen while it runs.
+static void drawUpdate(int percent, bool done, bool full) {
+  if (full) {
+    tft.fillScreen(BG);
+    tft.fillRoundRect(40, 108, W - 80, 8, 3, TRACK);
+  }
+  tft.setTextDatum(MC_DATUM);
+  tft.fillRect(0, 64, W, 32, BG);
+  tft.setFreeFont(&FreeSansBold9pt7b);
+  tft.setTextColor(FG);
+  tft.drawString(done ? "Update installed" : String("Updating firmware ") + percent + "%", W / 2, 80);
+  int filled = (W - 80) * percent / 100;
+  if (filled > 0) tft.fillRoundRect(40, 108, max(8, filled), 8, 3, ACCENT);
+  tft.fillRect(0, 136, W, 32, BG);
+  tft.setFreeFont(&FreeSans9pt7b);
+  tft.setTextColor(DIM);
+  tft.drawString(done ? "Restarting..." : "Keep the phone nearby", W / 2, 152);
+  tft.setTextDatum(TL_DATUM);
+}
+
 // --- touch ---
 
 static bool nowPlayingLayout = false;  // which layout is on screen (loop only)
@@ -644,6 +805,7 @@ void setup() {
 
   lock = xSemaphoreCreateMutex();
   Serial.println("CYD-REMOTE READY");
+  Serial.println("firmware: id=" FW_ID " flavor=" FW_FLAVOR " board=" FW_BOARD);
   startBle();
 }
 
@@ -652,6 +814,28 @@ void loop() {
   static Song shown;
   static bool firstDraw = true, noticeShown = false;
   static uint8_t shownPressed = B_NONE;
+  static int shownUpdate = -1;
+
+  int percent = updatePercent;
+  bool done = updateDone;
+  if (percent >= 0 || done) {
+    if (done) percent = 100;
+    if (percent != shownUpdate) {
+      drawUpdate(percent, done, shownUpdate < 0);
+      shownUpdate = percent;
+    }
+    if (done) {
+      delay(1000);  // lets the "done" notification go out
+      esp_restart();
+    }
+    delay(10);
+    return;
+  }
+  if (shownUpdate >= 0) {  // an update stopped part-way: back to the usual screen
+    shownUpdate = -1;
+    firstDraw = true;
+    drawnArt = UINT32_MAX;
+  }
 
   pollTouch();
 

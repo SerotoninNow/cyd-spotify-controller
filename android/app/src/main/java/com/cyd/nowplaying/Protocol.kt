@@ -8,6 +8,9 @@ import java.util.UUID
 object Protocol {
     val SERVICE: UUID = UUID.fromString("8d5f0001-3c4b-4f1e-9a57-6b1c2d0e7a10")
     val CHARACTERISTIC: UUID = UUID.fromString("8d5f0002-3c4b-4f1e-9a57-6b1c2d0e7a10")
+    val FIRMWARE_INFO: UUID = UUID.fromString("8d5f0003-3c4b-4f1e-9a57-6b1c2d0e7a10")
+    val FIRMWARE_UPDATE: UUID = UUID.fromString("8d5f0004-3c4b-4f1e-9a57-6b1c2d0e7a10")
+    val NOTIFY_CONFIG: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
 
     const val STATE_NONE = 0
     const val STATE_PAUSED = 1
@@ -17,6 +20,13 @@ object Protocol {
     private const val COVER: Byte = 0x02
     private const val PIECE: Byte = 0x03
     const val PIECE_HEADER = 9
+
+    // Firmware update, on FIRMWARE_UPDATE; the CYD answers in notifications ("ready", "done",
+    // "err:<why>").
+    private const val UPDATE_BEGIN: Byte = 0x10
+    private const val UPDATE_DATA: Byte = 0x11
+    private const val UPDATE_END: Byte = 0x12
+    const val UPDATE_DATA_HEADER = 5
 
     data class Song(
         val state: Int,
@@ -69,6 +79,31 @@ object Protocol {
             out.toByteArray()
         }
     }
+
+    fun updateBegin(size: Int, sha256: ByteArray): ByteArray {
+        val out = ByteArrayOutputStream()
+        out.write(UPDATE_BEGIN.toInt())
+        writeU32(out, size.toLong())
+        out.write(sha256)
+        return out.toByteArray()
+    }
+
+    fun updateData(offset: Int, image: ByteArray, maxLen: Int): ByteArray {
+        val out = ByteArrayOutputStream()
+        out.write(UPDATE_DATA.toInt())
+        writeU32(out, offset.toLong())
+        out.write(image, offset, minOf(maxLen - UPDATE_DATA_HEADER, image.size - offset))
+        return out.toByteArray()
+    }
+
+    fun updateEnd() = byteArrayOf(UPDATE_END)
+
+    // "id=…;flavor=…;board=…" from FIRMWARE_INFO.
+    fun firmwareInfo(value: ByteArray): Map<String, String> =
+        String(value, Charsets.UTF_8).split(';').mapNotNull {
+            val eq = it.indexOf('=')
+            if (eq > 0) it.substring(0, eq) to it.substring(eq + 1) else null
+        }.toMap()
 
     private fun writeU32(out: ByteArrayOutputStream, v: Long) {
         for (i in 0 until 4) out.write(((v shr (8 * i)) and 0xFF).toInt())

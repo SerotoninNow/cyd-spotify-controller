@@ -90,6 +90,14 @@ class MediaListener : NotificationListenerService() {
         AppState.setNowPlaying(describe())
     }
 
+    // Starts sending this app's firmware to the CYD; returns why it can't, or null once started.
+    fun updateFirmware(): String? {
+        val bundled = Firmware.bundled(this) ?: return "This app carries no CYD firmware."
+        val board = AppState.cydFirmware?.get("board") ?: return "The CYD isn't connected."
+        val image = bundled.image(this, board) ?: return "This app's firmware for $board is missing or damaged."
+        return if (link.startUpdate(image)) null else "The CYD isn't ready for an update yet."
+    }
+
     // The CYD may be paired after the listener started, when there was none to pick yet.
     fun reconnectIfNoDevice() {
         if (running && !link.hasDevice) reconnect()

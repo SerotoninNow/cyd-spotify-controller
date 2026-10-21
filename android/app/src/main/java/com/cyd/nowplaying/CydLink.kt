@@ -6,6 +6,7 @@ import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothGatt
 import android.bluetooth.BluetoothGattCallback
 import android.bluetooth.BluetoothGattCharacteristic
+import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
 import android.bluetooth.BluetoothStatusCodes
@@ -20,6 +21,9 @@ import android.util.Log
 // service. Writes go one at a time (Android allows one in flight); the newest song details
 // go before any cover pieces, and a new cover replaces one still on its way.
 //
+// On connecting it also reads which firmware the CYD runs, and it can send a firmware update;
+// while one runs, nothing else is sent.
+//
 // Everything runs on `handler`'s thread; Bluetooth callbacks are passed over to it.
 @SuppressLint("MissingPermission")  // checked by hasPermission() before anything starts
 class CydLink(
@@ -29,12 +33,17 @@ class CydLink(
 ) {
     private var gatt: BluetoothGatt? = null
     private var characteristic: BluetoothGattCharacteristic? = null
+    private var infoCharacteristic: BluetoothGattCharacteristic? = null
+    private var updateCharacteristic: BluetoothGattCharacteristic? = null
     private var address: String? = null
     private var deviceName = "CYD"
     private var maxWrite = 20  // bytes per write: the MTU less 3, at most MAX_VALUE
     private var busy = false
     private var refreshed = false  // asked Android to forget its cached service list
     private var retryDelay = FIRST_RETRY  // ms; grows while reconnecting keeps failing
+    // Reads and settings that go before any writes once connected; each returns whether it
+    // started (and so has a callback coming).
+    private val setup = ArrayDeque<(BluetoothGatt) -> Boolean>()
 
     private var song: Protocol.Song? = null
     private var songDirty = false
@@ -42,8 +51,16 @@ class CydLink(
     private var cover: ByteArray? = null  // null: no cover
     private val coverQueue = ArrayDeque<ByteArray>()
 
+    // Firmware update: begin, wait for "ready", the image in order, end, wait for "done".
+    private enum class Phase { IDLE, BEGIN, WAIT_READY, DATA, WAIT_DONE }
+    private var phase = Phase.IDLE
+    private var image: ByteArray? = null
+    private var imageSent = 0
+    private var shownPercent = -1
+
     val ready get() = characteristic != null
     val hasDevice get() = address != null
+    val canUpdate get() = ready && updateCharacteristic != null && phase == Phase.IDLE
 
     fun hasPermission() =
         Build.VERSION.SDK_INT < 31 ||
@@ -69,12 +86,17 @@ class CydLink(
     }
 
     fun close() {
+        if (phase != Phase.IDLE) failUpdate("the connection closed")
         handler.removeCallbacks(reconnect)
         gatt?.close()
         gatt = null
         characteristic = null
+        infoCharacteristic = null
+        updateCharacteristic = null
+        setup.clear()
         busy = false
         coverQueue.clear()
+        AppState.setCydFirmware(null)
     }
 
     fun sendSong(s: Protocol.Song) {
@@ -91,6 +113,19 @@ class CydLink(
         pump()
     }
 
+    // Sends `firmware` to the CYD, which installs it and restarts. Progress goes to AppState.
+    fun startUpdate(firmware: ByteArray): Boolean {
+        if (!canUpdate) return false
+        image = firmware
+        imageSent = 0
+        shownPercent = -1
+        phase = Phase.BEGIN
+        gatt?.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
+        AppState.setUpdate("Starting the update…", true)
+        pump()
+        return true
+    }
+
     private fun queueCover() {
         coverQueue.clear()
         val jpeg = cover
@@ -100,8 +135,15 @@ class CydLink(
 
     private fun pump() {
         val g = gatt ?: return
-        val c = characteristic ?: return
         if (busy) return
+        while (setup.isNotEmpty()) {
+            if (setup.removeFirst()(g)) {
+                busy = true
+                return
+            }
+        }
+        if (phase != Phase.IDLE) return pumpUpdate(g)
+        val c = characteristic ?: return
         val packet = when {
             songDirty -> song?.let { Protocol.song(it, maxWrite) }.also { songDirty = false }
             coverQueue.isNotEmpty() -> coverQueue.removeFirst()
@@ -122,6 +164,77 @@ class CydLink(
         }
     }
 
+    private fun pumpUpdate(g: BluetoothGatt) {
+        val c = updateCharacteristic ?: return failUpdate("the CYD has no update service")
+        val img = image ?: return failUpdate("no firmware")
+        val packet = when (phase) {
+            Phase.BEGIN -> Protocol.updateBegin(img.size, Firmware.sha256(img))
+            Phase.DATA ->
+                if (imageSent < img.size) Protocol.updateData(imageSent, img, maxWrite) else Protocol.updateEnd()
+            else -> return  // waiting for the CYD's answer
+        }
+        val sent = try {
+            write(g, c, packet)
+        } catch (e: Exception) {
+            Log.w(TAG, "update write refused", e)
+            return failUpdate("Android refused a write")
+        }
+        if (!sent) {
+            handler.postDelayed({ pump() }, 50)
+            return
+        }
+        busy = true
+        when {
+            phase == Phase.BEGIN -> phase = Phase.WAIT_READY
+            imageSent < img.size -> {
+                imageSent += packet.size - Protocol.UPDATE_DATA_HEADER
+                val percent = (imageSent.toLong() * 100 / img.size).toInt()
+                if (percent != shownPercent) {
+                    shownPercent = percent
+                    AppState.setUpdate("Sending the firmware: $percent%", true)
+                }
+            }
+            else -> {
+                phase = Phase.WAIT_DONE
+                AppState.setUpdate("Checking and installing…", true)
+            }
+        }
+    }
+
+    // A notification from the CYD about the update.
+    private fun onUpdateMessage(msg: String) {
+        Log.i(TAG, "update: $msg")
+        when {
+            msg == "ready" && phase == Phase.WAIT_READY -> {
+                phase = Phase.DATA
+                pump()
+            }
+            msg == "done" && phase == Phase.WAIT_DONE -> {
+                endUpdate()
+                AppState.setUpdate("Installed. The CYD is restarting with the new firmware.", false)
+            }
+            msg.startsWith("err:") -> failUpdate("the CYD said: ${msg.removePrefix("err:")}")
+        }
+    }
+
+    private fun failUpdate(why: String) {
+        if (phase == Phase.IDLE) return
+        val atEnd = phase == Phase.WAIT_DONE
+        endUpdate()
+        AppState.setUpdate(
+            if (atEnd) "The link dropped as the update finished; the firmware line shows whether it was installed."
+            else "Update stopped: $why. The CYD keeps the firmware it had.",
+            false,
+        )
+        handler.post { pump() }  // back to song details
+    }
+
+    private fun endUpdate() {
+        phase = Phase.IDLE
+        image = null
+        gatt?.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_BALANCED)
+    }
+
     @Suppress("DEPRECATION")
     private fun write(g: BluetoothGatt, c: BluetoothGattCharacteristic, value: ByteArray): Boolean {
         val type = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT  // acknowledged, so in order
@@ -131,6 +244,19 @@ class CydLink(
             c.writeType = type
             c.value = value
             g.writeCharacteristic(c)
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun enableNotifications(g: BluetoothGatt, c: BluetoothGattCharacteristic): Boolean {
+        val d = c.getDescriptor(Protocol.NOTIFY_CONFIG) ?: return false
+        if (!g.setCharacteristicNotification(c, true)) return false
+        val on = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+        return if (Build.VERSION.SDK_INT >= 33) {
+            g.writeDescriptor(d, on) == BluetoothStatusCodes.SUCCESS
+        } else {
+            d.value = on
+            g.writeDescriptor(d)
         }
     }
 
@@ -153,11 +279,16 @@ class CydLink(
         false
     }
 
-    private fun onReady(c: BluetoothGattCharacteristic) {
+    private fun onReady(c: BluetoothGattCharacteristic, info: BluetoothGattCharacteristic?, update: BluetoothGattCharacteristic?) {
         characteristic = c
+        infoCharacteristic = info
+        updateCharacteristic = update
         busy = false
         retryDelay = FIRST_RETRY
         onStatus("Connected to $deviceName")
+        setup.clear()
+        if (info != null) setup.add { g -> g.readCharacteristic(info) } else AppState.setCydFirmware(emptyMap())
+        if (update != null) setup.add { g -> enableNotifications(g, update) }
         // The CYD forgets everything when the link drops: send it all again.
         songDirty = song != null
         queueCover()
@@ -173,6 +304,7 @@ class CydLink(
                     if (!g.requestMtu(517)) g.discoverServices()
                 } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                     Log.i(TAG, "disconnected, status $status")
+                    failUpdate("the Bluetooth link dropped")
                     // Start over: a fresh autoConnect request waits for the CYD to come back.
                     close()
                     onStatus("Waiting for $deviceName")
@@ -193,9 +325,13 @@ class CydLink(
         override fun onServicesDiscovered(g: BluetoothGatt, status: Int) {
             handler.post {
                 if (g != gatt) return@post
-                val c = g.getService(Protocol.SERVICE)?.getCharacteristic(Protocol.CHARACTERISTIC)
+                val service = g.getService(Protocol.SERVICE)
+                val c = service?.getCharacteristic(Protocol.CHARACTERISTIC)
+                val info = service?.getCharacteristic(Protocol.FIRMWARE_INFO)
                 when {
-                    c != null -> onReady(c)
+                    // Without firmware info, either the firmware predates it or Android's list is stale.
+                    c != null && (info != null || refreshed) ->
+                        onReady(c, info, service.getCharacteristic(Protocol.FIRMWARE_UPDATE))
                     !refreshed -> {
                         refreshed = true
                         refreshCache(g)
@@ -209,10 +345,52 @@ class CydLink(
         override fun onCharacteristicWrite(g: BluetoothGatt, c: BluetoothGattCharacteristic, status: Int) {
             handler.post {
                 if (g != gatt) return@post
-                if (status != BluetoothGatt.GATT_SUCCESS) Log.w(TAG, "write failed, status $status")
+                busy = false
+                if (status != BluetoothGatt.GATT_SUCCESS) {
+                    Log.w(TAG, "write failed, status $status")
+                    if (c.uuid == Protocol.FIRMWARE_UPDATE) return@post failUpdate("a write failed (status $status)")
+                }
+                pump()
+            }
+        }
+
+        override fun onCharacteristicRead(g: BluetoothGatt, c: BluetoothGattCharacteristic, value: ByteArray, status: Int) {
+            handler.post {
+                if (g != gatt) return@post
+                if (c.uuid == Protocol.FIRMWARE_INFO) {
+                    AppState.setCydFirmware(if (status == BluetoothGatt.GATT_SUCCESS) Protocol.firmwareInfo(value) else emptyMap())
+                }
                 busy = false
                 pump()
             }
+        }
+
+        @Deprecated("Android 12 and older")
+        @Suppress("DEPRECATION")
+        override fun onCharacteristicRead(g: BluetoothGatt, c: BluetoothGattCharacteristic, status: Int) {
+            if (Build.VERSION.SDK_INT < 33) onCharacteristicRead(g, c, c.value ?: ByteArray(0), status)
+        }
+
+        override fun onDescriptorWrite(g: BluetoothGatt, d: BluetoothGattDescriptor, status: Int) {
+            handler.post {
+                if (g != gatt) return@post
+                if (status != BluetoothGatt.GATT_SUCCESS) Log.w(TAG, "notification setup failed, status $status")
+                busy = false
+                pump()
+            }
+        }
+
+        override fun onCharacteristicChanged(g: BluetoothGatt, c: BluetoothGattCharacteristic, value: ByteArray) {
+            val msg = String(value, Charsets.UTF_8)
+            handler.post {
+                if (g == gatt && c.uuid == Protocol.FIRMWARE_UPDATE) onUpdateMessage(msg)
+            }
+        }
+
+        @Deprecated("Android 12 and older")
+        @Suppress("DEPRECATION")
+        override fun onCharacteristicChanged(g: BluetoothGatt, c: BluetoothGattCharacteristic) {
+            if (Build.VERSION.SDK_INT < 33) onCharacteristicChanged(g, c, c.value ?: ByteArray(0))
         }
     }
 
