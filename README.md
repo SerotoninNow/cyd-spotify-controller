@@ -273,7 +273,7 @@ Background usage limits).
 **Updating the CYD.** Each app release carries the remote firmware from the same commit.
 When it differs from what the CYD runs, the app's *CYD firmware* section says *Update
 available* with an *Update the CYD* button. Keep the phone near the CYD: sending takes about
-two minutes, with the progress on both screens. The CYD checks the whole image before
+half a minute, with the progress on both screens. The CYD checks the whole image before
 switching to it and restarts into it; if anything goes wrong on the way (the link drops, a
 bad piece), it keeps the firmware it had. Only a phone paired with the CYD can send it an
 update.
