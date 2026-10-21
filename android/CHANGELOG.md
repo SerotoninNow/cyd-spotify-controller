@@ -4,6 +4,14 @@ Each version is a tag (`app-v…`) with a signed APK on the
 [Releases page](https://github.com/SerotoninNow/cyd-spotify-controller/releases). All releases
 are signed with the same key, so each installs over the one before.
 
+## Unreleased
+
+- New: updates the CYD's firmware over Bluetooth. The app carries the remote firmware from
+  the same commit; a *CYD firmware* section shows what the CYD runs and offers *Update the
+  CYD* when they differ (about two minutes, with progress on both screens). The CYD checks
+  the image's SHA-256 and keeps its firmware if anything fails. Needs the remote firmware
+  from the same commit, flashed over USB once: older builds have no room for an update.
+
 ## 1.0.3 (2026-10-20)
 
 - Faster reconnects: after the CYD restarts, the app now tries again after half a second

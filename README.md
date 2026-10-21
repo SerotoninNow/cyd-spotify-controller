@@ -211,7 +211,9 @@ progress and the phone's volume, with the buttons in a row underneath; the play 
 whether it's playing. Without the app it goes back to the big buttons.
 
 **A1. Flash the remote firmware** from this branch (above). Older remote builds lack the
-song-details service.
+song-details service. This is the last time it needs USB: from then on the app updates the
+CYD over Bluetooth (see *Updating the CYD* below). Remote builds from before that feature
+can't take those updates, so flash once more over USB if yours is older.
 
 **A2. Install the app.** On the phone, open the
 [Releases page](https://github.com/SerotoninNow/cyd-spotify-controller/releases), find the
@@ -230,8 +232,12 @@ Gradle where the SDK is, either with `ANDROID_HOME` or a file `android/local.pro
 containing `sdk.dir=/path/to/Android/Sdk`, then:
 
 ```bash
-cd android && ./gradlew assembleDebug
+cd android && ./bundle-firmware.sh && ./gradlew assembleDebug
 ```
+
+`bundle-firmware.sh` builds the remote firmware with PlatformIO (`PIO=.venv/bin/pio` if `pio`
+isn't on your PATH) and packs it into the app. Without it the app works the same but can't
+update the CYD.
 
 Install `android/app/build/outputs/apk/debug/app-debug.apk` with USB debugging on
 (Settings > About phone > Software information, tap *Build number* seven times; then
@@ -264,6 +270,17 @@ On Samsung phones, keep it from being put to sleep: Settings > Apps > CYD Now Pl
 Battery > **Unrestricted** (or add it to *Never sleeping apps* under Settings > Battery >
 Background usage limits).
 
+**Updating the CYD.** Each app release carries the remote firmware from the same commit.
+When it differs from what the CYD runs, the app's *CYD firmware* section says *Update
+available* with an *Update the CYD* button. Keep the phone near the CYD: sending takes about
+two minutes, with the progress on both screens. The CYD checks the whole image before
+switching to it and restarts into it; if anything goes wrong on the way (the link drops, a
+bad piece), it keeps the firmware it had. Only a phone paired with the CYD can send it an
+update.
+
+- **"too old to update over Bluetooth"**: flash the remote firmware over USB once (A1).
+- **"Replace the CYD's firmware"**: the CYD runs a different variant of the firmware from
+  the one this app carries (for example a private build). The app asks before replacing it.
 - **No cover**: some apps don't share one with Android; the title still shows.
 - **"has no now-playing service"**: the CYD still runs the old remote firmware, or Android
   remembers the old one. Flash it again, then forget CYD Remote in Bluetooth settings and pair
