@@ -4,6 +4,14 @@ Each version is a tag (`app-v…`) with a signed APK on the
 [Releases page](https://github.com/SerotoninNow/cyd-spotify-controller/releases). All releases
 are signed with the same key, so each installs over the one before.
 
+## 1.0.3 (2026-10-20)
+
+- Faster reconnects: after the CYD restarts, the app now tries again after half a second
+  instead of 5 seconds (slowing down to 5 seconds only if it keeps failing). This also covers
+  the first write after power-up, which the phone sometimes refuses with status 133 while it
+  re-encrypts the link. Song details are back about 6 seconds after a restart instead of 11;
+  most of what's left is the phone noticing the CYD went away.
+
 ## 1.0.2 (2026-10-20)
 
 - Fixed: with the CYD paired after the app had started, the status stayed at "No CYD chosen"

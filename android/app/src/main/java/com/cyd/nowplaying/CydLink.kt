@@ -34,6 +34,7 @@ class CydLink(
     private var maxWrite = 20  // bytes per write: the MTU less 3, at most MAX_VALUE
     private var busy = false
     private var refreshed = false  // asked Android to forget its cached service list
+    private var retryDelay = FIRST_RETRY  // ms; grows while reconnecting keeps failing
 
     private var song: Protocol.Song? = null
     private var songDirty = false
@@ -135,9 +136,12 @@ class CydLink(
 
     private val reconnect = Runnable { connect(address) }
 
+    // Soon at first: a link that drops while the CYD restarts, or a first write refused before
+    // the phone has re-encrypted the link, usually works on the next try. Slower if it keeps failing.
     private fun retryLater() {
         handler.removeCallbacks(reconnect)
-        handler.postDelayed(reconnect, 5000)
+        handler.postDelayed(reconnect, retryDelay)
+        retryDelay = minOf(retryDelay * 2, LAST_RETRY)
     }
 
     // Android keeps the service list of a paired device; after reflashing the CYD it can be
@@ -152,6 +156,7 @@ class CydLink(
     private fun onReady(c: BluetoothGattCharacteristic) {
         characteristic = c
         busy = false
+        retryDelay = FIRST_RETRY
         onStatus("Connected to $deviceName")
         // The CYD forgets everything when the link drops: send it all again.
         songDirty = song != null
@@ -215,5 +220,7 @@ class CydLink(
         private const val TAG = "CydLink"
         // Android refuses longer writes even when the MTU would allow more (517 - 3 = 514).
         private const val MAX_VALUE = 512
+        private const val FIRST_RETRY = 500L
+        private const val LAST_RETRY = 5000L
     }
 }
