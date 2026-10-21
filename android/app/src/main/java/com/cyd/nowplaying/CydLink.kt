@@ -56,6 +56,7 @@ class CydLink(
     private var phase = Phase.IDLE
     private var image: ByteArray? = null
     private var imageSent = 0
+    private var imageAcked = 0  // what the CYD has confirmed writing ("ack:<n>")
     private var shownPercent = -1
 
     val ready get() = characteristic != null
@@ -118,12 +119,22 @@ class CydLink(
         if (!canUpdate) return false
         image = firmware
         imageSent = 0
+        imageAcked = 0
         shownPercent = -1
         phase = Phase.BEGIN
         gatt?.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
         AppState.setUpdate("Starting the update…", true)
+        heardFromCyd()
         pump()
         return true
+    }
+
+    // An update gives up if the CYD goes quiet: every step and every 8 KB brings an answer.
+    private val stalled = Runnable { failUpdate("the CYD stopped answering") }
+
+    private fun heardFromCyd() {
+        handler.removeCallbacks(stalled)
+        handler.postDelayed(stalled, UPDATE_TIMEOUT)
     }
 
     private fun queueCover() {
@@ -167,14 +178,18 @@ class CydLink(
     private fun pumpUpdate(g: BluetoothGatt) {
         val c = updateCharacteristic ?: return failUpdate("the CYD has no update service")
         val img = image ?: return failUpdate("no firmware")
-        val packet = when (phase) {
-            Phase.BEGIN -> Protocol.updateBegin(img.size, Firmware.sha256(img))
-            Phase.DATA ->
-                if (imageSent < img.size) Protocol.updateData(imageSent, img, maxWrite) else Protocol.updateEnd()
+        val data = phase == Phase.DATA && imageSent < img.size
+        // Data goes unacknowledged, many writes to a connection event, but no further ahead of
+        // what the CYD has confirmed than UPDATE_WINDOW: it writes to flash as it goes.
+        if (data && imageSent - imageAcked >= UPDATE_WINDOW) return
+        val packet = when {
+            phase == Phase.BEGIN -> Protocol.updateBegin(img.size, Firmware.sha256(img))
+            data -> Protocol.updateData(imageSent, img, maxWrite)
+            phase == Phase.DATA -> Protocol.updateEnd()
             else -> return  // waiting for the CYD's answer
         }
         val sent = try {
-            write(g, c, packet)
+            write(g, c, packet, if (data) BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE else BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
         } catch (e: Exception) {
             Log.w(TAG, "update write refused", e)
             return failUpdate("Android refused a write")
@@ -203,10 +218,15 @@ class CydLink(
 
     // A notification from the CYD about the update.
     private fun onUpdateMessage(msg: String) {
-        Log.i(TAG, "update: $msg")
+        if (!msg.startsWith("ack:")) Log.i(TAG, "update: $msg")
+        if (phase != Phase.IDLE) heardFromCyd()
         when {
             msg == "ready" && phase == Phase.WAIT_READY -> {
                 phase = Phase.DATA
+                pump()
+            }
+            msg.startsWith("ack:") && phase == Phase.DATA -> {
+                imageAcked = msg.removePrefix("ack:").toIntOrNull() ?: imageAcked
                 pump()
             }
             msg == "done" && phase == Phase.WAIT_DONE -> {
@@ -230,14 +250,20 @@ class CydLink(
     }
 
     private fun endUpdate() {
+        handler.removeCallbacks(stalled)
         phase = Phase.IDLE
         image = null
         gatt?.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_BALANCED)
     }
 
     @Suppress("DEPRECATION")
-    private fun write(g: BluetoothGatt, c: BluetoothGattCharacteristic, value: ByteArray): Boolean {
-        val type = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT  // acknowledged, so in order
+    // Acknowledged by default, so everything arrives in order and Android reports each.
+    private fun write(
+        g: BluetoothGatt,
+        c: BluetoothGattCharacteristic,
+        value: ByteArray,
+        type: Int = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT,
+    ): Boolean {
         return if (Build.VERSION.SDK_INT >= 33) {
             g.writeCharacteristic(c, value, type) == BluetoothStatusCodes.SUCCESS
         } else {
@@ -400,5 +426,8 @@ class CydLink(
         private const val MAX_VALUE = 512
         private const val FIRST_RETRY = 500L
         private const val LAST_RETRY = 5000L
+        // Firmware bytes sent ahead of the CYD's last "ack" (it acks every 8 KB).
+        private const val UPDATE_WINDOW = 24 * 1024
+        private const val UPDATE_TIMEOUT = 15_000L
     }
 }

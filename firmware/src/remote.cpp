@@ -21,7 +21,9 @@
 // Firmware update: a characteristic only a paired (encrypted) link can write, with packets
 // like the now-playing ones; the CYD answers each step in a notification on it.
 //   0x10 begin   size (u32), SHA-256 of the image (32 bytes)      -> "ready" or "err:<why>"
-//   0x11 data    offset (u32), image bytes, in order
+//   0x11 data    offset (u32), image bytes, in order; may come unacknowledged, so the CYD
+//                reports "ack:<bytes so far>" every UPDATE_ACK_EVERY bytes and at the end,
+//                and the app keeps no more than a few of those ahead
 //   0x12 end     checks the SHA-256 and the image                 -> "done" (then restarts)
 //                                                                     or "err:<why>"
 // A problem part-way also sends "err:<why>"; the running firmware stays until "done".
@@ -265,7 +267,8 @@ class NowPlayingWrites : public BLECharacteristicCallbacks {
 
 static esp_ota_handle_t otaHandle = 0;  // 0: no update running
 static const esp_partition_t *otaPartition = nullptr;
-static size_t otaSize = 0, otaGot = 0;
+static size_t otaSize = 0, otaGot = 0, otaAcked = 0;
+static const size_t UPDATE_ACK_EVERY = 8192;
 static uint8_t otaSha[32];
 static mbedtls_sha256_context otaShaCtx;
 
@@ -309,7 +312,7 @@ static void onUpdateBegin(const uint8_t *d, size_t n) {
   }
   mbedtls_sha256_init(&otaShaCtx);
   mbedtls_sha256_starts(&otaShaCtx, 0);
-  otaGot = 0;
+  otaGot = otaAcked = 0;
   updatePercent = 0;
   bump();
   updateReply("ready");
@@ -325,6 +328,13 @@ static void onUpdateData(const uint8_t *d, size_t n) {
   if (e != ESP_OK) return updateFail(esp_err_to_name(e));
   mbedtls_sha256_update(&otaShaCtx, d + 5, len);
   otaGot += len;
+  if (otaGot - otaAcked >= UPDATE_ACK_EVERY || otaGot == otaSize) {
+    otaAcked = otaGot;
+    char msg[20];
+    snprintf(msg, sizeof(msg), "ack:%u", (unsigned)otaGot);
+    updateChar->setValue((uint8_t *)msg, strlen(msg));
+    updateChar->notify();
+  }
   int8_t percent = otaGot * 100 / otaSize;
   if (percent != updatePercent) {
     updatePercent = percent;
@@ -427,7 +437,8 @@ static void startBle() {
   BLECharacteristic *info = np->createCharacteristic(FIRMWARE_INFO_CHAR, BLECharacteristic::PROPERTY_READ);
   info->setValue("id=" FW_ID ";flavor=" FW_FLAVOR ";board=" FW_BOARD);
   updateChar = np->createCharacteristic(
-      FIRMWARE_UPDATE_CHAR, BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_NOTIFY);
+      FIRMWARE_UPDATE_CHAR,
+      BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR | BLECharacteristic::PROPERTY_NOTIFY);
   updateChar->setAccessPermissions(ESP_GATT_PERM_WRITE_ENCRYPTED);  // paired phones only
   updateChar->addDescriptor(new BLE2902());
   updateChar->setCallbacks(new UpdateWrites());
