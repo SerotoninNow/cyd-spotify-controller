@@ -166,6 +166,9 @@ If you already have the app, share it with another phone: open it and tap *Share
 then pick Quick Share (or Bluetooth, or any messaging app that accepts files). On the other
 phone, open the received file in My Files to install it. It still needs step A4 there.
 
+To set a friend up so they get every future release automatically (no files to send), see
+[android/SHARING.md](android/SHARING.md).
+
 **A3. Or build it yourself.** You need JDK 17 or newer (21 recommended) and the Android SDK
 (Android Studio installs both; or the command-line tools with `platforms;android-36`). Tell
 Gradle where the SDK is, either with `ANDROID_HOME` or a file `android/local.properties`
@@ -209,6 +212,32 @@ it runs in the background whenever notification access is on, and reconnects by 
 On Samsung phones, keep it from being put to sleep: Settings > Apps > CYD Now Playing >
 Battery > **Unrestricted** (or add it to *Never sleeping apps* under Settings > Battery >
 Background usage limits).
+
+### Installing and updating the app without the Play Store
+
+The app isn't on the Play Store; it installs from the APK over ADB, the developer channel,
+which needs no Google account, no fee and no app registration. Use USB (above), or go
+cable-free by turning on *Wireless debugging* (Developer options) and pairing the phone once:
+
+```bash
+adb pair PHONE_IP:PORT && adb connect PHONE_IP:PORT
+```
+
+(The pair address, code and connect port are shown under *Wireless debugging*.) After that,
+install or update to the latest release in one step:
+
+```bash
+android/install-app.sh
+```
+
+It downloads the newest release APK (needs the `gh` CLI) and installs it, or pass a local APK
+path to install that instead. Releases share one signing key, so each installs over the last
+with no uninstall.
+
+For the long term: Android is phasing in developer verification that can block installing
+unverified apps on *certified* devices. ADB installs stay exempt, so the above keeps working
+with no Google account. If that ever changes, a de-Googled ROM (GrapheneOS, LineageOS, ...)
+has no such gate and installs APKs freely.
 
 **Updating the CYD.** Each app release carries the remote firmware from the same commit.
 When it differs from what the CYD runs, the app's *CYD firmware* section says *Update
