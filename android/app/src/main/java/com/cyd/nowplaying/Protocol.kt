@@ -19,6 +19,8 @@ object Protocol {
     private const val SONG: Byte = 0x01
     private const val COVER: Byte = 0x02
     private const val PIECE: Byte = 0x03
+    private const val TEXT: Byte = 0x05
+    private const val TEXT_PIECE: Byte = 0x06
     const val PIECE_HEADER = 9
 
     // Firmware update, on FIRMWARE_UPDATE; the CYD answers in notifications ("ready", "done",
@@ -76,6 +78,30 @@ object Protocol {
             writeU32(out, id.toLong() and 0xFFFFFFFFL)
             writeU32(out, offset.toLong())
             out.write(jpeg, offset, minOf(step, jpeg.size - offset))
+            out.toByteArray()
+        }
+    }
+
+    // A glyph image for the title/artist/album, sent when they aren't plain ASCII. `width` 0
+    // tells the CYD to drop any image and draw the text natively.
+    fun text(id: Int, width: Int, height: Int): ByteArray {
+        val out = ByteArrayOutputStream()
+        out.write(TEXT.toInt())
+        writeU32(out, id.toLong() and 0xFFFFFFFFL)
+        out.write(width and 0xFF); out.write((width shr 8) and 0xFF)
+        out.write(height and 0xFF); out.write((height shr 8) and 0xFF)
+        return out.toByteArray()
+    }
+
+    // The 4-bit-alpha image in pieces of at most `maxLen` bytes each, header included.
+    fun textPieces(id: Int, alpha: ByteArray, maxLen: Int): List<ByteArray> {
+        val step = maxLen - PIECE_HEADER
+        return (alpha.indices step step).map { offset ->
+            val out = ByteArrayOutputStream()
+            out.write(TEXT_PIECE.toInt())
+            writeU32(out, id.toLong() and 0xFFFFFFFFL)
+            writeU32(out, offset.toLong())
+            out.write(alpha, offset, minOf(step, alpha.size - offset))
             out.toByteArray()
         }
     }

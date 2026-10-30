@@ -50,6 +50,11 @@ class CydLink(
     private var coverId = 0
     private var cover: ByteArray? = null  // null: no cover
     private val coverQueue = ArrayDeque<ByteArray>()
+    private var textId = 0
+    private var textAlpha: ByteArray? = null  // null: text is plain ASCII, drawn natively
+    private var textW = 0
+    private var textH = 0
+    private val textQueue = ArrayDeque<ByteArray>()
 
     // Firmware update: begin, wait for "ready", the image in order, end, wait for "done".
     private enum class Phase { IDLE, BEGIN, WAIT_READY, DATA, WAIT_DONE }
@@ -97,6 +102,7 @@ class CydLink(
         setup.clear()
         busy = false
         coverQueue.clear()
+        textQueue.clear()
         AppState.setCydFirmware(null)
     }
 
@@ -111,6 +117,18 @@ class CydLink(
         coverId = id
         cover = jpeg
         queueCover()
+        pump()
+    }
+
+    // `alpha` is the title/artist/album glyph image (4-bit, 2 px per byte, row-major), or null
+    // when the text is plain ASCII and the CYD should draw it with its own font.
+    fun sendText(id: Int, width: Int, height: Int, alpha: ByteArray?) {
+        if (id == textId && alpha.contentEquals(textAlpha)) return
+        textId = id
+        textAlpha = alpha
+        textW = width
+        textH = height
+        queueText()
         pump()
     }
 
@@ -144,6 +162,17 @@ class CydLink(
         if (jpeg != null) coverQueue.addAll(Protocol.pieces(coverId, jpeg, maxWrite))
     }
 
+    private fun queueText() {
+        textQueue.clear()
+        val a = textAlpha
+        if (a == null) {
+            textQueue.add(Protocol.text(textId, 0, 0))  // clear: the CYD draws the text itself
+        } else {
+            textQueue.add(Protocol.text(textId, textW, textH))
+            textQueue.addAll(Protocol.textPieces(textId, a, maxWrite))
+        }
+    }
+
     private fun pump() {
         val g = gatt ?: return
         if (busy) return
@@ -158,6 +187,7 @@ class CydLink(
         val packet = when {
             songDirty -> song?.let { Protocol.song(it, maxWrite) }.also { songDirty = false }
             coverQueue.isNotEmpty() -> coverQueue.removeFirst()
+            textQueue.isNotEmpty() -> textQueue.removeFirst()
             else -> null
         } ?: return
         val sent = try {
@@ -170,7 +200,11 @@ class CydLink(
         if (sent) {
             busy = true
         } else {  // the stack is busy with something else: try again shortly
-            if (packet[0].toInt() == 1) songDirty = true else coverQueue.addFirst(packet)
+            when (packet[0].toInt()) {
+                1 -> songDirty = true
+                5, 6 -> textQueue.addFirst(packet)
+                else -> coverQueue.addFirst(packet)
+            }
             handler.postDelayed({ pump() }, 50)
         }
     }
@@ -318,6 +352,7 @@ class CydLink(
         // The CYD forgets everything when the link drops: send it all again.
         songDirty = song != null
         queueCover()
+        queueText()
         pump()
     }
 

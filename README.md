@@ -254,7 +254,10 @@ update.
 - **"has no now-playing service"**: the CYD still runs the old remote firmware, or Android
   remembers the old one. Flash it again, then forget CYD Remote in Bluetooth settings and pair
   again.
-- Titles in non-Latin scripts show as `?`, as in the other versions.
+- Non-Latin scripts, accents and emoji: the app draws these itself (the phone has the fonts)
+  and sends them to the CYD as a small image, so titles in Chinese, Japanese, Korean, Cyrillic,
+  etc. show properly. Emoji appear as single-colour shapes. (The standalone Wi-Fi build has no
+  app feeding it, so it still shows `?` for non-Latin text.)
 
 **Publishing a new version** (for the repository owner): push a tag such as `app-v1.1`, and
 the *Android app* workflow builds a signed APK and attaches it to a new release. It signs with

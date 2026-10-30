@@ -8,8 +8,10 @@ import android.content.IntentFilter
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
+import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Rect
+import android.graphics.Typeface
 import android.media.AudioManager
 import android.media.MediaMetadata
 import android.media.session.MediaController
@@ -20,6 +22,9 @@ import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.service.notification.NotificationListenerService
+import android.text.StaticLayout
+import android.text.TextPaint
+import android.text.TextUtils
 import android.util.Log
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.Executors
@@ -38,6 +43,8 @@ class MediaListener : NotificationListenerService() {
     private var current: MediaController? = null
     private var coverKey: Any? = null  // what the last cover was made from
     private var coverJob = 0
+    private var textKey: String? = null  // the title/artist/album the last glyph image was made from
+    private var textJob = 0
     private var running = false
 
     override fun onListenerConnected() {
@@ -148,6 +155,7 @@ class MediaListener : NotificationListenerService() {
         val song = c?.let { songOf(it) } ?: Protocol.Song(Protocol.STATE_NONE, volume(null), 0, 0, "", "", "", "")
         link.sendSong(song)
         updateCover(c?.metadata)
+        updateText(song)
         AppState.setNowPlaying(describe())
     }
 
@@ -268,9 +276,85 @@ class MediaListener : NotificationListenerService() {
         return bytes.toByteArray()
     }
 
+    // --- text glyphs ---
+
+    // The CYD's fonts are ASCII only, so when the title/artist/album have other characters
+    // (CJK, emoji, accents) we draw them here — Android has the fonts — and send a small
+    // 4-bit-alpha image for the CYD to blit. Plain-ASCII songs send nothing and keep the
+    // CYD's own font. The size and layout match TXT_W/TXT_H in firmware/src/remote.cpp.
+    private fun updateText(s: Protocol.Song) {
+        val key = "${s.title}\u0000${s.artist}\u0000${s.album}"
+        if (key == textKey) return
+        textKey = key
+        val job = ++textJob
+        if (isAscii(s.title) && isAscii(s.artist) && isAscii(s.album)) {
+            link.sendText(0, 0, 0, null)  // the CYD can draw this itself
+            return
+        }
+        // Rendering text to a bitmap takes a moment: off the main thread, like the cover.
+        artWorker.execute {
+            val alpha = try {
+                renderGlyphs(s.title.ifEmpty { if (s.state == Protocol.STATE_PLAYING) "Playing" else "Nothing playing" },
+                             s.artist, s.album)
+            } catch (e: Exception) {
+                Log.w(TAG, "text render failed", e)
+                null
+            }
+            handler.post {
+                if (job != textJob) return@post  // the song has changed since
+                if (alpha == null) link.sendText(0, 0, 0, null)
+                else link.sendText(CRC32().apply { update(alpha) }.value.toInt(), TEXT_W, TEXT_H, alpha)
+            }
+        }
+    }
+
+    private fun isAscii(s: String) = s.all { it.code < 0x80 }
+
+    // Lays out title (bold), artist, then album (dimmer) in the CYD's text column and returns
+    // the result as 4-bit alpha, 2 pixels per byte, row-major (even pixel in the high nibble).
+    private fun renderGlyphs(title: String, artist: String, album: String): ByteArray {
+        val bmp = Bitmap.createBitmap(TEXT_W, TEXT_H, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bmp)
+        var y = 0
+        y = drawField(canvas, title, y, 22f, Typeface.DEFAULT_BOLD, 0xFF, 3)
+        if (y < TEXT_H) y = drawField(canvas, artist, y + 4, 18f, Typeface.DEFAULT, 0xFF, 2)
+        if (y < TEXT_H) drawField(canvas, album, y + 2, 15f, Typeface.DEFAULT, 0x8C, 1)  // dimmer
+
+        val px = IntArray(TEXT_W * TEXT_H)
+        bmp.getPixels(px, 0, TEXT_W, 0, 0, TEXT_W, TEXT_H)
+        bmp.recycle()
+        val out = ByteArray((TEXT_W * TEXT_H + 1) / 2)
+        for (i in px.indices) {
+            val nibble = (px[i] ushr 28) and 0x0F  // top 4 bits of the alpha channel
+            if (i and 1 == 0) out[i shr 1] = (nibble shl 4).toByte()
+            else out[i shr 1] = (out[i shr 1].toInt() or nibble).toByte()
+        }
+        return out
+    }
+
+    // Draws one field wrapped to at most `lines`, ellipsized, from `top` (sizes are CYD pixels,
+    // not phone sp); returns the y below it.
+    private fun drawField(canvas: Canvas, text: String, top: Int, sizePx: Float, face: Typeface, alpha: Int, lines: Int): Int {
+        if (text.isEmpty() || top >= TEXT_H) return top
+        val paint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.argb(alpha, 255, 255, 255)
+            textSize = sizePx
+            typeface = face
+        }
+        val layout = StaticLayout.Builder.obtain(text, 0, text.length, paint, TEXT_W)
+            .setMaxLines(lines).setEllipsize(TextUtils.TruncateAt.END).build()
+        canvas.save()
+        canvas.translate(0f, top.toFloat())
+        layout.draw(canvas)
+        canvas.restore()
+        return top + layout.height
+    }
+
     companion object {
         private const val TAG = "MediaListener"
         private const val COVER_SIZE = 128
+        private const val TEXT_W = 156  // must match TXT_W (= TEXT_W) in firmware/src/remote.cpp
+        private const val TEXT_H = 108  // must match TXT_H
         private const val VOLUME_CHANGED = "android.media.VOLUME_CHANGED_ACTION"
 
         var instance: MediaListener? = null

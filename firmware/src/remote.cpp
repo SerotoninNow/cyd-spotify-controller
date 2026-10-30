@@ -15,6 +15,10 @@
 //                then title, artist, album and player name, UTF-8, each ending in a 0 byte
 //   0x02 cover   id (u32), JPEG length (u32, 0: no cover)
 //   0x03 piece   id (u32), offset (u32), JPEG bytes; the cover shows once all have arrived
+//   0x05 text    id (u32), width (u16), height (u16); 4-bit-alpha glyph image for the
+//                title/artist/album, which the sender draws when they aren't plain ASCII
+//                (CJK, emoji, accents) since the ESP32 has no font for those. width 0: none
+//   0x06 tpiece  id (u32), offset (u32), alpha bytes (2 pixels each); shown once all arrive
 //
 // Firmware info: a readable characteristic, "id=<FW_ID>;flavor=<FW_FLAVOR>;board=<FW_BOARD>".
 //
@@ -149,6 +153,23 @@ static uint32_t artVersion = 0;   // bumped when the loop should redraw the art 
 static uint16_t artPixels[ART * ART];
 static bool artValid = false;  // loop only
 
+// Title/artist/album rendered to a 4-bit-alpha image by the sender when they aren't plain
+// ASCII: the ESP32 has no font for CJK, emoji or accents, so the phone/PC draws them. It
+// arrives in pieces like the cover and is blitted over the text column in the text colour.
+static const int TXT_W = TEXT_W, TXT_H = 108;  // the area it fills, at (TEXT_X, ART_Y)
+static const size_t TXT_MAX = ((size_t)TXT_W * TXT_H + 1) / 2;
+static uint8_t *txtBuf = nullptr;  // being received (Bluetooth task only)
+static size_t txtLen = 0, txtTotal = 0;
+static uint32_t txtId = 0;
+static int txtInW = 0, txtInH = 0;
+static uint8_t *txtReady = nullptr;  // complete, waiting for the loop (guarded by `lock`)
+static int txtReadyW = 0, txtReadyH = 0;
+static bool txtClear = false;      // the song's text is plain ASCII: draw it natively
+static uint32_t txtVersion = 0;    // bumped when the loop should redraw the text
+
+static uint8_t *txtImg = nullptr;  // the current glyph image (loop only); null: draw natively
+static int txtImgW = 0, txtImgH = 0;
+
 static BLEHIDDevice *hid;
 static BLECharacteristic *input;
 static volatile bool connected = false;
@@ -249,6 +270,67 @@ static void onPiece(const uint8_t *d, size_t n) {
   artLen = artTotal = 0;
 }
 
+static void dropText() {
+  free(txtBuf);
+  txtBuf = nullptr;
+  txtLen = txtTotal = 0;
+}
+
+static void showNoText() {
+  xSemaphoreTake(lock, portMAX_DELAY);
+  free(txtReady);
+  txtReady = nullptr;
+  txtClear = true;
+  txtVersion++;
+  xSemaphoreGive(lock);
+}
+
+static void onText(const uint8_t *d, size_t n) {
+  if (n < 9) return;
+  dropText();
+  txtId = readU32(d + 1);
+  int w = d[5] | d[6] << 8, h = d[7] | d[8] << 8;
+  if (w == 0 || h == 0) {  // the text is plain ASCII: draw it natively
+    showNoText();
+    return;
+  }
+  size_t total = ((size_t)w * h + 1) / 2;  // 4-bit alpha, 2 pixels per byte
+  if (total > TXT_MAX) {
+    Serial.printf("text: %dx%d is too big\n", w, h);
+    showNoText();
+    return;
+  }
+  txtBuf = (uint8_t *)malloc(total);
+  if (txtBuf) {
+    txtTotal = total;
+    txtInW = w;
+    txtInH = h;
+  }
+}
+
+static void onTextPiece(const uint8_t *d, size_t n) {
+  if (n < 9 || !txtBuf || readU32(d + 1) != txtId) return;  // an older image's last pieces
+  size_t offset = readU32(d + 5), len = n - 9;
+  if (offset != txtLen || txtLen + len > txtTotal) {
+    Serial.println("text: pieces out of order, dropped");
+    dropText();
+    return;
+  }
+  memcpy(txtBuf + txtLen, d + 9, len);
+  txtLen += len;
+  if (txtLen < txtTotal) return;
+  xSemaphoreTake(lock, portMAX_DELAY);
+  free(txtReady);
+  txtReady = txtBuf;
+  txtReadyW = txtInW;
+  txtReadyH = txtInH;
+  txtClear = false;
+  txtVersion++;
+  xSemaphoreGive(lock);
+  txtBuf = nullptr;
+  txtLen = txtTotal = 0;
+}
+
 class NowPlayingWrites : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic *c) override {
     String v = c->getValue();
@@ -259,6 +341,8 @@ class NowPlayingWrites : public BLECharacteristicCallbacks {
       case 0x01: onSong(d, n); break;
       case 0x02: onCover(d, n); break;
       case 0x03: onPiece(d, n); break;
+      case 0x05: onText(d, n); break;
+      case 0x06: onTextPiece(d, n); break;
     }
   }
 };
@@ -389,6 +473,8 @@ class ServerEvents : public BLEServerCallbacks {
     }
     dropArt();
     showNoArt();
+    dropText();
+    showNoText();
     xSemaphoreTake(lock, portMAX_DELAY);
     song = Song();  // back to the big buttons until the app speaks again
     version++;
@@ -639,19 +725,46 @@ static void drawBigButton(int b, bool pressed) {
 
 // Now playing:
 
+// Blit the sender's 4-bit-alpha glyph image (title/artist/album) over the text column, one
+// row at a time, blending the background toward the text colour through a 16-step lookup.
+static void blitText() {
+  static uint16_t row[TXT_W];
+  uint16_t lut[16];
+  for (int a = 0; a < 16; a++) {
+    int t = a * 255 / 15;
+    uint8_t r = (((BG >> 11) & 0x1F) * (255 - t) + ((FG >> 11) & 0x1F) * t) / 255;
+    uint8_t g = (((BG >> 5) & 0x3F) * (255 - t) + ((FG >> 5) & 0x3F) * t) / 255;
+    uint8_t b = ((BG & 0x1F) * (255 - t) + (FG & 0x1F) * t) / 255;
+    lut[a] = (r << 11) | (g << 5) | b;
+  }
+  int w = min(txtImgW, TXT_W), h = min(txtImgH, TXT_H);
+  size_t stride = ((size_t)txtImgW + 1) / 2;  // bytes per source row
+  for (int y = 0; y < h; y++) {
+    const uint8_t *p = txtImg + (size_t)y * stride;
+    for (int x = 0; x < w; x++)
+      row[x] = lut[(x & 1) ? (p[x >> 1] & 0x0F) : (p[x >> 1] >> 4)];  // even pixel: high nibble
+    tft.pushImage(TEXT_X, ART_Y + y, w, 1, row);
+  }
+}
+
 static void drawText(const Song &s, const String &line) {
   tft.fillRect(TEXT_X, ART_Y, W - TEXT_X, ART, BG);
   tft.setTextDatum(TL_DATUM);
-  tft.setFreeFont(&FreeSansBold9pt7b);
-  String title = s.title.length() ? s.title : String(s.playing ? "Playing" : "Nothing playing");
-  int y = drawWrapped(toAscii(title), TEXT_X, ART_Y + 2, TEXT_W, 3, 22, FG) + 4;
-  tft.setFreeFont(&FreeSans9pt7b);
-  y = drawWrapped(toAscii(s.artist), TEXT_X, y, TEXT_W, 2, 20, FG);
-  tft.setTextFont(2);
-  if (s.album.length() && y < 112) {
-    tft.setTextColor(DIM);
-    tft.drawString(fitText(toAscii(s.album), TEXT_W), TEXT_X, y + 2);
+  if (txtImg) {
+    blitText();
+  } else {
+    tft.setFreeFont(&FreeSansBold9pt7b);
+    String title = s.title.length() ? s.title : String(s.playing ? "Playing" : "Nothing playing");
+    int y = drawWrapped(toAscii(title), TEXT_X, ART_Y + 2, TEXT_W, 3, 22, FG) + 4;
+    tft.setFreeFont(&FreeSans9pt7b);
+    y = drawWrapped(toAscii(s.artist), TEXT_X, y, TEXT_W, 2, 20, FG);
+    tft.setTextFont(2);
+    if (s.album.length() && y < 112) {
+      tft.setTextColor(DIM);
+      tft.drawString(fitText(toAscii(s.album), TEXT_W), TEXT_X, y + 2);
+    }
   }
+  tft.setTextFont(2);
   tft.setTextColor(DIM);
   tft.drawString(fitText(toAscii(line), TEXT_W), TEXT_X, ART_Y + ART - 16);
 }
@@ -821,7 +934,7 @@ void setup() {
 }
 
 void loop() {
-  static uint32_t drawnVersion = 0, drawnArt = UINT32_MAX, drawnSecond = UINT32_MAX;
+  static uint32_t drawnVersion = 0, drawnArt = UINT32_MAX, drawnText = UINT32_MAX, drawnSecond = UINT32_MAX;
   static Song shown;
   static bool firstDraw = true, noticeShown = false;
   static uint8_t shownPressed = B_NONE;
@@ -851,7 +964,7 @@ void loop() {
   pollTouch();
 
   xSemaphoreTake(lock, portMAX_DELAY);
-  uint32_t v = version, av = artVersion;
+  uint32_t v = version, av = artVersion, tv = txtVersion;
   Song s = (v != drawnVersion) ? song : shown;
   uint8_t *art = nullptr;
   size_t artBytes = 0;
@@ -863,6 +976,17 @@ void loop() {
     clearArt = artClear;
     artClear = false;
   }
+  uint8_t *txt = nullptr;
+  int txtW = 0, txtH = 0;
+  bool clearTxt = false;
+  if (tv != drawnText) {
+    txt = txtReady;
+    txtW = txtReadyW;
+    txtH = txtReadyH;
+    txtReady = nullptr;
+    clearTxt = txtClear;
+    txtClear = false;
+  }
   xSemaphoreGive(lock);
 
   if (art) {
@@ -870,6 +994,16 @@ void loop() {
     free(art);
   } else if (clearArt) {
     artValid = false;
+  }
+
+  if (txt) {
+    free(txtImg);
+    txtImg = txt;
+    txtImgW = txtW;
+    txtImgH = txtH;
+  } else if (clearTxt) {
+    free(txtImg);
+    txtImg = nullptr;
   }
 
   bool noticeOn = notice.length() && (int32_t)(noticeUntil - millis()) > 0;
@@ -887,8 +1021,9 @@ void loop() {
       if (full || (pressedButton == b) != (shownPressed == b)) drawBigButton(b, pressedButton == b);
   } else {
     if (full || av != drawnArt) drawArt();
-    if (full || s.title != shown.title || s.artist != shown.artist || s.album != shown.album ||
-        s.source != shown.source || noticeOn != noticeShown || (!s.title.length() && s.playing != shown.playing))
+    if (full || tv != drawnText || s.title != shown.title || s.artist != shown.artist ||
+        s.album != shown.album || s.source != shown.source || noticeOn != noticeShown ||
+        (!s.title.length() && s.playing != shown.playing))
       drawText(s, noticeOn ? notice : s.source);
     uint32_t pos = s.progressMs + (s.playing ? millis() - s.at : 0);
     if (s.durationMs) pos = min(pos, s.durationMs);
@@ -907,5 +1042,6 @@ void loop() {
   noticeShown = noticeOn;
   drawnVersion = v;
   drawnArt = av;
+  drawnText = tv;
   delay(10);
 }
